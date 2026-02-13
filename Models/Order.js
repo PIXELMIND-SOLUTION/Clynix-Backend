@@ -183,7 +183,25 @@ rejectedPharmacies: {
   default: [],
 },
 
-
+// Add to Order schema
+pickupProgress: [
+  {
+    pharmacyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Pharmacy'
+    },
+    pickedMedicines: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Medicine'
+    }],
+    pickupCompleted: {
+      type: Boolean,
+      default: false
+    },
+    completedAt: Date,
+    proofImageUrl: String
+  }
+],
 
 
 

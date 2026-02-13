@@ -1,6 +1,6 @@
 // router/riderRoutes.js or similar
 import express from "express";
-import {  addBankDetailsToRider, createRiderQuery, forgotPassword, getAcceptedOrdersForRiderController, getAllActiveOrdersForRiderController, getAllCompletedOrdersForRiderController, getNewOrdersForRiderController, getPickedUpOrdersForRiderController, getRiderBankDetails, getRiderDrivingLicense, getRiderEarningsGraph, getRiderNotifications, getRiderOrdersByStatus, getRiderOrderStats, getRiderProfile, getRiderWalletController, getSingleOrderForRiderController, getUpiInfo, loginRider, markOrderAsDeliveredController, signupRider, updateRiderLocation, updateRiderProfileImage, updateRiderStatus, updateRiderStatusController, uploadDeliveryProof, uploadMedicineProof, withdrawAmountFromWalletController } from "../Controller/RiderController.js";
+import {  addBankDetailsToRider, createRiderQuery, forgotPassword, getAcceptedOrdersForRiderController, getAllActiveOrdersForRiderController, getAllCompletedOrdersForRiderController, getNewOrdersForRiderController, getPickedUpOrdersForRiderController, getRiderBankDetails, getRiderDrivingLicense, getRiderEarningsGraph, getRiderNotifications, getRiderOrdersByStatus, getRiderOrderStats, getRiderProfile, getRiderWalletController, getSingleOrderForRiderController, getUpiInfo, loginRider, markOrderAsDeliveredController, signupRider, updateRiderLocation, updateRiderProfileImage, updateRiderStatus, updateRiderStatusController, uploadDeliveryProof, uploadMedicineProof, withdrawAmountFromWalletController,pharmacyPickupVerification } from "../Controller/RiderController.js";
 
 const router = express.Router();
 
@@ -9,6 +9,11 @@ router.get('/myprofile/:riderId', getRiderProfile);
 router.put('/updateprofileimage/:riderId', updateRiderProfileImage);
 router.get('/dashboard/:riderId', getRiderOrderStats);
 router.get('/neworders/:riderId', getNewOrdersForRiderController);
+// SINGLE API
+router.post(
+  '/rider/:riderId/order/:orderId/pharmacy/:pharmacyId/pickup-verify',
+  pharmacyPickupVerification
+);
 router.get('/acceptedorders/:riderId', getAcceptedOrdersForRiderController);
 router.get("/pickeduporders/:riderId", getPickedUpOrdersForRiderController);
 router.put('/update-status/:riderId', updateRiderStatusController);
