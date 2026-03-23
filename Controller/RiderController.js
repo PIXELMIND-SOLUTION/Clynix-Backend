@@ -569,297 +569,250 @@ export const getNewOrdersForRiderController = async (req, res) => {
   try {
     const { riderId } = req.params;
 
-    console.log("🚀 Fetching orders for riderId:", riderId);
-
     if (!mongoose.Types.ObjectId.isValid(riderId)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Invalid rider ID" 
-      });
+      return res.status(400).json({ success: false, message: "Invalid rider ID" });
     }
 
-    // Step 1: Check if rider exists
     const rider = await Rider.findById(riderId);
     if (!rider) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Rider not found" 
-      });
-    }
-    console.log("✅ Rider found:", rider.name);
-
-    // Step 2: Fetch orders without populate first
-    const rawOrders = await Order.find({ 
-      assignedRider: new mongoose.Types.ObjectId(riderId), 
-      assignedRiderStatus: 'Assigned' 
-    }).lean();
-
-    console.log(`📦 Raw orders found: ${rawOrders.length}`);
-
-    if (rawOrders.length === 0) {
-      return res.status(200).json({ 
-        success: true,
-        message: 'No new orders assigned to you',
-        newOrders: [] 
-      });
+      return res.status(404).json({ success: false, message: "Rider not found" });
     }
 
-    // Step 3: Now populate with correct paths
-    const newOrders = await Order.find({ 
-      assignedRider: new mongoose.Types.ObjectId(riderId), 
-      assignedRiderStatus: 'Assigned' 
+    const newOrders = await Order.find({
+      assignedRider: riderId,
+      assignedRiderStatus: "Assigned",
     })
-    .populate({
-      path: 'orderItems.medicineId',
-      model: 'Medicine', 
-      select: 'name mrp description images pharmacyId'
-    })
-    .populate({
-      path: 'userId',
-      model: 'User', 
-      select: 'name mobile location'
-    })
-    .populate({
-      path: 'pharmacyResponses.pharmacyId',
-      model: 'Pharmacy', 
-      select: 'name address vendorPhone latitude longitude image'
-    })
-    .lean();
+      .populate({
+        path: "orderItems.medicineId",
+        model: "Medicine",
+        select: "name mrp description images pharmacyId",
+        populate: {
+          path: "pharmacyId",
+          model: "Pharmacy",
+          select: "name address vendorPhone latitude longitude image",
+        },
+      })
+      .populate({ path: "userId", model: "User" })
+      .lean();
 
-    console.log(`✅ Orders after populate: ${newOrders.length}`);
-
-    if (newOrders.length === 0) {
-      return res.status(200).json({ 
-        success: true,
-        message: 'No new orders assigned to you',
-        newOrders: [] 
-      });
+    if (!newOrders.length) {
+      return res.status(200).json({ success: true, message: "No new orders assigned to you", newOrders: [] });
     }
 
     const riderLat = parseFloat(rider.latitude);
     const riderLon = parseFloat(rider.longitude);
     const deliveryCharge = parseFloat(rider.deliveryCharge) || 0;
 
-    // Helper functions for distance calculation
     const calculateDistance = (point1, point2) => {
       const [lon1, lat1] = point1;
       const [lon2, lat2] = point2;
       const R = 6371;
-      const dLat = (lat2 - lat1) * Math.PI / 180;
-      const dLon = (lon2 - lon1) * Math.PI / 180;
-      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const dLat = ((lat2 - lat1) * Math.PI) / 180;
+      const dLon = ((lon2 - lon1) * Math.PI) / 180;
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos((lat1 * Math.PI) / 180) *
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(dLon / 2) ** 2;
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
       return R * c;
     };
 
-    const calculateTime = (distance) => {
-      const averageSpeed = 20;
-      const timeInHours = distance / averageSpeed;
-      return timeInHours * 60;
-    };
-
-    const addMinutesToTime = (date, minutes) => {
-      return new Date(date.getTime() + minutes * 60000);
-    };
-
-    const formatTimeTo12Hour = (date) => {
-      return date.toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: true
-      });
-    };
-
-    // Process orders - Enhanced with pharmacy pickup information
     const updatedOrders = newOrders.map(order => {
-      console.log(`\n🔧 Processing order: ${order._id}`);
-
-      if (!order.orderItems || order.orderItems.length === 0) {
-        console.log("❌ Order has no items");
-        return null;
-      }
-
-      const acceptedPharmacies = order.pharmacyResponses.filter(response => response.status === "Accepted");
-
-      if (acceptedPharmacies.length === 0) {
-        console.log("❌ No accepted pharmacies found");
-        return null;
-      }
+      if (!order.orderItems?.length) return null;
 
       const user = order.userId;
-      if (!user) {
-        console.log("❌ User not found");
-        return null;
-      }
+      if (!user?.location?.coordinates) return null;
+      const userLocation = user.location.coordinates;
 
-      // Check user location
-      let userLocation = null;
-      if (user.location && user.location.coordinates) {
-        userLocation = user.location.coordinates;
-      } else if (Array.isArray(user.location)) {
-        userLocation = user.location;
-      } else if (user.location && user.location.longitude && user.location.latitude) {
-        userLocation = [user.location.longitude, user.location.latitude];
-      }
-
-      if (!userLocation || userLocation.length < 2) {
-        console.log("❌ User location missing or invalid");
-        return null;
-      }
-
-      // ============= EXTENSION: Add pharmacy pickup information =============
-      // Group order items by pharmacy for pickup information
+      // -------------------
+      // Pharmacy pickups & orderItems with pharmacyDetails
+      // -------------------
       const pharmacyPickupMap = {};
-      
-      order.orderItems.forEach(item => {
-        if (item.medicineId && item.medicineId.pharmacyId) {
-          const pharmacyId = item.medicineId.pharmacyId._id?.toString() || item.medicineId.pharmacyId.toString();
-          
-          if (!pharmacyPickupMap[pharmacyId]) {
-            // Find pharmacy response details
-            const pharmacyResponse = acceptedPharmacies.find(
-              response => response.pharmacyId._id?.toString() === pharmacyId || 
-                         response.pharmacyId.toString() === pharmacyId
-            );
-            
-            pharmacyPickupMap[pharmacyId] = {
-              pharmacyId: pharmacyId,
-              pharmacyName: item.medicineId.pharmacyId.name || 'Unknown Pharmacy',
-              pharmacyAddress: item.medicineId.pharmacyId.address || 'Address not available',
-              pharmacyPhone: item.medicineId.pharmacyId.vendorPhone || 'Phone not available',
-              pharmacyLatitude: item.medicineId.pharmacyId.latitude,
-              pharmacyLongitude: item.medicineId.pharmacyId.longitude,
-              pharmacyImage: item.medicineId.pharmacyId.image || null,
-              responseStatus: pharmacyResponse?.status || 'Accepted',
-              medicines: [],
-              totalItems: 0,
-              isPickupCompleted: false // This will be checked against pickup proofs
-            };
-          }
-          
-          // Add medicine to this pharmacy's pickup list
-          pharmacyPickupMap[pharmacyId].medicines.push({
-            medicineId: item.medicineId._id,
-            name: item.medicineId.name,
-            mrp: item.medicineId.mrp,
-            quantity: item.quantity,
-            images: item.medicineId.images || [],
-            description: item.medicineId.description,
-            isPicked: false // Will be updated based on proofs
-          });
-          
-          pharmacyPickupMap[pharmacyId].totalItems += item.quantity;
-        }
-      });
-      
-      // Check which pharmacies already have pickup proofs
-      if (order.beforePickupProof && order.beforePickupProof.length > 0) {
-        const completedPickups = new Set();
-        order.beforePickupProof.forEach(proof => {
-          if (proof.pharmacyId) {
-            const pharmacyId = proof.pharmacyId.toString();
-            completedPickups.add(pharmacyId);
-            
-            // Mark specific medicines as picked if medicineId exists
-            if (proof.medicineId) {
-              const medicineId = proof.medicineId.toString();
-              if (pharmacyPickupMap[pharmacyId]) {
-                pharmacyPickupMap[pharmacyId].medicines.forEach(med => {
-                  if (med.medicineId.toString() === medicineId) {
-                    med.isPicked = true;
-                  }
-                });
-              }
-            }
-          }
-        });
-        
-        // Mark pharmacies as completed if all medicines are picked
-        Object.keys(pharmacyPickupMap).forEach(pharmacyId => {
-          const pharmacyData = pharmacyPickupMap[pharmacyId];
-          const allMedicinesPicked = pharmacyData.medicines.every(med => med.isPicked === true);
-          pharmacyData.isPickupCompleted = allMedicinesPicked;
-        });
-      }
-      
-      // Convert map to array for response
-      const pharmacyPickups = Object.values(pharmacyPickupMap);
-      
-      // Calculate estimated earnings
-      let estimatedEarning = 0;
-      if (rider.deliveryCharge) {
-        // Calculate distance from rider to first pharmacy and then to user
-        let totalDistance = 0;
-        
-        if (pharmacyPickups.length > 0) {
-          const firstPharmacy = pharmacyPickups[0];
-          // Rider to first pharmacy
-          totalDistance += calculateDistance(
-            [riderLon, riderLat],
-            [parseFloat(firstPharmacy.pharmacyLongitude), parseFloat(firstPharmacy.pharmacyLatitude)]
-          );
-          
-          // Last pharmacy to user
-          const lastPharmacy = pharmacyPickups[pharmacyPickups.length - 1];
-          totalDistance += calculateDistance(
-            [parseFloat(lastPharmacy.pharmacyLongitude), parseFloat(lastPharmacy.pharmacyLatitude)],
-            userLocation
-          );
-        }
-        
-        estimatedEarning = deliveryCharge + (totalDistance * 2); // Base + per km rate
-      }
+      const mappedOrderItems = order.orderItems.map(item => {
+        const pharmacy = item.medicineId?.pharmacyId;
+        if (!pharmacy) return null;
 
-      // ============= END OF EXTENSION =============
+        const pharmacyId = pharmacy._id.toString();
+        if (!pharmacyPickupMap[pharmacyId]) {
+          pharmacyPickupMap[pharmacyId] = {
+            pharmacyId,
+            pharmacyName: pharmacy.name,
+            pharmacyAddress: pharmacy.address,
+            pharmacyPhone: pharmacy.vendorPhone,
+            pharmacyLatitude: pharmacy.latitude,
+            pharmacyLongitude: pharmacy.longitude,
+            pharmacyImage: pharmacy.image || null,
+            responseStatus: "Accepted",
+            medicines: [],
+            totalItems: 0,
+            isPickupCompleted: false,
+          };
+        }
 
-      // Return the enhanced order with pharmacy pickup info and estimated earnings
-      return {
-        order: {
-          _id: order._id,
-          orderId: `ORD${order._id.toString().substring(0, 8).toUpperCase()}`,
-          userId: order.userId,
-          deliveryAddress: order.deliveryAddress,
-          orderItems: order.orderItems,
-          totalAmount: order.totalAmount,
-          status: order.status,
-          notes: order.notes,
-          paymentMethod: order.paymentMethod,
-          createdAt: order.createdAt,
-          pharmacyResponses: acceptedPharmacies,
-          // ============= NEW FIELDS ADDED WITHOUT BREAKING EXISTING STRUCTURE =============
-          pharmacyPickups: pharmacyPickups, // Array of pharmacies with medicines to pick
-          pickupProgress: {
-            totalPharmacies: pharmacyPickups.length,
-            completedPharmacies: pharmacyPickups.filter(p => p.isPickupCompleted).length,
-            totalMedicines: pharmacyPickups.reduce((sum, p) => sum + p.totalItems, 0),
-            pickedMedicines: pharmacyPickups.reduce((sum, p) => 
-              sum + p.medicines.filter(m => m.isPicked).length, 0
-            )
+        pharmacyPickupMap[pharmacyId].medicines.push({
+          medicineId: item.medicineId._id,
+          name: item.medicineId.name,
+          mrp: item.medicineId.mrp,
+          quantity: item.quantity,
+          images: item.medicineId.images || [],
+          description: item.medicineId.description,
+          isPicked: false,
+        });
+
+        pharmacyPickupMap[pharmacyId].totalItems += item.quantity;
+
+        return {
+          ...item,
+          pharmacyDetails: {
+            _id: pharmacy._id,
+            name: pharmacy.name,
+            address: pharmacy.address,
+            image: pharmacy.image || null,
+            latitude: parseFloat(pharmacy.latitude),
+            longitude: parseFloat(pharmacy.longitude),
           },
-          estimatedEarning: Math.round(estimatedEarning * 100) / 100,
-          nextPharmacy: pharmacyPickups.find(p => !p.isPickupCompleted) || null
-        }
+          isPicked: false,
+        };
+      }).filter(Boolean);
+
+      const pharmacyPickups = Object.values(pharmacyPickupMap);
+
+      // -------------------
+      // Estimated earning
+      // -------------------
+      let estimatedEarning = 0;
+      if (pharmacyPickups.length > 0) {
+        const firstPharmacy = pharmacyPickups[0];
+        const distanceToPharmacy = calculateDistance(
+          [riderLon, riderLat],
+          [parseFloat(firstPharmacy.pharmacyLongitude), parseFloat(firstPharmacy.pharmacyLatitude)]
+        );
+        const distanceToUser = calculateDistance(
+          [parseFloat(firstPharmacy.pharmacyLongitude), parseFloat(firstPharmacy.pharmacyLatitude)],
+          userLocation
+        );
+        estimatedEarning = deliveryCharge + (distanceToPharmacy + distanceToUser) * 2;
+      }
+
+      return {
+        ...order,
+        orderItems: mappedOrderItems,
+        pharmacyPickups,
+        estimatedEarning: Math.round(estimatedEarning * 100) / 100,
+        orderId: `ORD${order._id.toString().substring(0, 8).toUpperCase()}`,
+        pharmacyResponses: undefined, // remove pharmacyResponses from response
       };
-    }).filter(order => order !== null);
+    }).filter(Boolean);
 
-    console.log(`🎯 Final orders to return: ${updatedOrders.length}`);
-
-    return res.status(200).json({ 
+    return res.status(200).json({
       success: true,
-      message: updatedOrders.length > 0 ? 'New orders fetched successfully' : 'No orders with complete location data',
-      newOrders: updatedOrders
+      message: "New orders fetched successfully",
+      newOrders: updatedOrders,
     });
+
   } catch (error) {
-    console.error("❌ Error fetching new orders for rider:", error);
-    return res.status(500).json({ 
+    console.error("Error fetching orders:", error);
+    return res.status(500).json({
       success: false,
-      message: "Server error while fetching new orders.",
-      error: error.message 
+      message: "Server error while fetching new orders",
+      error: error.message,
     });
   }
 };
+
+
+
+export const getAcceptedPharmacyOrdersForRiderController = async (req, res) => {
+  try {
+    const { riderId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(riderId)) {
+      return res.status(400).json({ success: false, message: "Invalid rider ID" });
+    }
+
+    const rider = await Rider.findById(riderId);
+    if (!rider) {
+      return res.status(404).json({ success: false, message: "Rider not found" });
+    }
+
+    // Fetch orders with medicines -> pharmacy populated
+    const orders = await Order.find({ assignedRider: riderId })
+      .populate({
+        path: "orderItems.medicineId",
+        model: "Medicine",
+        select: "pharmacyId",
+        populate: {
+          path: "pharmacyId",
+          model: "Pharmacy",
+          select: "name address latitude longitude image",
+        },
+      })
+      .lean();
+
+    const filteredOrders = orders.filter(order =>
+      order.pharmacyResponses?.some(resp => resp.status === "Accepted")
+    );
+
+    if (!filteredOrders.length) {
+      return res.status(200).json({
+        success: true,
+        message: "No orders with pharmacy Accepted status",
+        newOrders: [],
+      });
+    }
+
+    const updatedOrders = filteredOrders.map(order => {
+      // Keep only Accepted pharmacyResponses
+      const acceptedPharmacyResponses = order.pharmacyResponses
+        .filter(resp => resp.status === "Accepted")
+        .map(resp => {
+          // Find corresponding pharmacy from orderItems
+          const pharmacyItem = order.orderItems.find(
+            item => item.medicineId?.pharmacyId?._id.toString() === resp.pharmacyId.toString()
+          );
+
+          const pharmacy = pharmacyItem?.medicineId?.pharmacyId;
+
+          return {
+            ...resp,
+            pharmacyDetails: pharmacy
+              ? {
+                  pharmacyId: pharmacy._id,
+                  name: pharmacy.name,
+                  address: pharmacy.address,
+                  latitude: parseFloat(pharmacy.latitude),
+                  longitude: parseFloat(pharmacy.longitude),
+                  image: pharmacy.image || null,
+                }
+              : null,
+          };
+        });
+
+      return {
+        _id: order._id,
+        orderId: `ORD${order._id.toString().substring(0, 8).toUpperCase()}`,
+        pharmacyResponses: acceptedPharmacyResponses,
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Orders with pharmacy Accepted status fetched successfully",
+      newOrders: updatedOrders,
+    });
+
+  } catch (error) {
+    console.error("Error fetching orders:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while fetching orders",
+      error: error.message,
+    });
+  }
+};
+
+
 
 
 /**
@@ -1249,88 +1202,121 @@ export const pharmacyPickupVerification = async (req, res) => {
 export const getAcceptedOrdersForRiderController = async (req, res) => {
   try {
     const { riderId } = req.params;
+    console.log("Rider ID:", riderId);
 
-    // Validate riderId
     if (!mongoose.Types.ObjectId.isValid(riderId)) {
       return res.status(400).json({ message: "Invalid rider ID" });
     }
 
-    // Fetch the first accepted order that is not delivered
-    const acceptedOrder = await Order.findOne({
+    // ✅ FIX: Sirf ACTIVE orders lo (Completed/Delivered wale mat lo)
+    let order = await Order.findOne({
       assignedRider: riderId,
-      assignedRiderStatus: 'Accepted',
-      status: { $ne: 'Delivered' } // Only fetch orders that are not delivered yet
+      status: { 
+        $in: ['Rider Accepted', 'Accepted', 'PickedUp', 'Assigned'], // Active statuses
+        $nin: ['Delivered', 'Completed', 'Cancelled'] // Exclude completed
+      }
     })
       .populate({
         path: 'orderItems.medicineId',
-        select: 'name mrp description images pharmacyId', // Select the necessary fields
+        select: 'name mrp description images pharmacyId',
         populate: {
           path: 'pharmacyId',
-          select: 'name address vendorPhone latitude longitude' // Populate pharmacyId fields
+          select: 'name address vendorPhone latitude longitude'
         }
       })
       .populate({
         path: 'userId',
-        select: 'name mobile location' // Select user fields
+        select: 'name mobile location'
       })
+      .sort({ createdAt: -1 })
       .lean();
 
-    if (!acceptedOrder) {
+    if (!order) {
+      console.log("No active order found for rider:", riderId);
       return res.status(404).json({ message: 'No accepted orders available for you at the moment.' });
     }
 
-    // Fetch rider details
+    console.log("Found ACTIVE order:", order._id);
+    console.log("Order Status:", order.status);
+
+    // ✅ Filter pharmacyResponses to only include "Rider Accepted" wale pharmacies
+    const riderAcceptedPharmacies = order.pharmacyResponses?.filter(
+      (resp) => resp.status === 'Rider Accepted'
+    ) || [];
+
+    console.log("Rider accepted pharmacies count:", riderAcceptedPharmacies.length);
+
+    if (riderAcceptedPharmacies.length === 0) {
+      console.log("No pharmacy with Rider Accepted status");
+      return res.status(404).json({ message: 'No accepted orders available for you at the moment.' });
+    }
+
+    // ✅ Filter pharmacyResponses to only include active ones (Accepted + Rider Accepted)
+    const activePharmacyResponses = order.pharmacyResponses?.filter(
+      (resp) => resp.status === 'Rider Accepted' || resp.status === 'Accepted'
+    ) || [];
+
+    // Replace pharmacyResponses with filtered
+    order.pharmacyResponses = activePharmacyResponses;
+
+    // Filter orderItems to only include medicines whose pharmacyId is in activePharmacyResponses
+    const activePharmacyIds = activePharmacyResponses.map(r => r.pharmacyId.toString());
+    order.orderItems = order.orderItems.filter(item => 
+      item.medicineId?.pharmacyId && activePharmacyIds.includes(item.medicineId.pharmacyId._id?.toString())
+    );
+
+    if (order.orderItems.length === 0) {
+      return res.status(404).json({ message: 'No accepted orders available for you at the moment.' });
+    }
+
+    // Rider location
     const rider = await Rider.findById(riderId);
     if (!rider) {
       return res.status(404).json({ message: "Rider not found" });
     }
-
     const riderLat = parseFloat(rider.latitude);
     const riderLon = parseFloat(rider.longitude);
 
-    // Process the accepted order
-    const order = acceptedOrder;
-    const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
+    const activePharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
     const userLocation = order.userId?.location?.coordinates;
 
-    const pharmacyLat = parseFloat(pharmacy?.latitude);
-    const pharmacyLon = parseFloat(pharmacy?.longitude);
-    const userLat = userLocation?.[1];
-    const userLon = userLocation?.[0];
+    let pickupDistance = 0, dropDistance = 0, formattedPickupTime = null, formattedDropTime = null;
 
-    // Calculate distances
-    const pickupDistance = calculateDistance([riderLon, riderLat], [pharmacyLon, pharmacyLat]);
-    const dropDistance = calculateDistance([pharmacyLon, pharmacyLat], [userLon, userLat]);
+    if (activePharmacy && userLocation) {
+      const pharmacyLat = parseFloat(activePharmacy.latitude);
+      const pharmacyLon = parseFloat(activePharmacy.longitude);
+      const userLat = userLocation[1];
+      const userLon = userLocation[0];
 
-    // Time estimates
-    const pickupMinutes = calculateTime(pickupDistance);
-    const dropMinutes = calculateTime(dropDistance);
+      pickupDistance = calculateDistance([riderLon, riderLat], [pharmacyLon, pharmacyLat]);
+      dropDistance = calculateDistance([pharmacyLon, pharmacyLat], [userLon, userLat]);
 
-    const pickupTimeEstimate = addMinutesToTime(order.createdAt, pickupMinutes);
-    const dropTimeEstimate = addMinutesToTime(order.createdAt, pickupMinutes + dropMinutes);
+      const pickupMinutes = calculateTime(pickupDistance);
+      const dropMinutes = calculateTime(dropDistance);
 
-    const formattedPickupTime = formatTimeTo12Hour(pickupTimeEstimate);
-    const formattedDropTime = formatTimeTo12Hour(dropTimeEstimate);
+      const pickupTimeEstimate = addMinutesToTime(order.createdAt, pickupMinutes);
+      const dropTimeEstimate = addMinutesToTime(order.createdAt, pickupMinutes + dropMinutes);
 
-    // Add all the necessary data to the order response
-    const orderResponse = {
-      order,
-      formattedPickupDistance: pickupDistance.toFixed(2),
-      formattedDropDistance: dropDistance.toFixed(2),
-      pickupTime: formattedPickupTime,
-      dropTime: formattedDropTime
-    };
+      formattedPickupTime = formatTimeTo12Hour(pickupTimeEstimate);
+      formattedDropTime = formatTimeTo12Hour(dropTimeEstimate);
+    }
 
-    // Return the current active order
-    return res.status(200).json({ acceptedOrder: orderResponse });
+    // Send response
+    return res.status(200).json({
+      acceptedOrder: {
+        ...order,
+        formattedPickupDistance: pickupDistance.toFixed(2),
+        formattedDropDistance: dropDistance.toFixed(2),
+        pickupTime: formattedPickupTime,
+        dropTime: formattedDropTime
+      }
+    });
 
   } catch (error) {
     console.error("Error fetching accepted orders for rider:", error);
     return res.status(500).json({ message: "Server error while fetching accepted orders." });
   }
 };
-
-
 
 export const getPickedUpOrdersForRiderController = async (req, res) => {
   try {
@@ -1432,28 +1418,45 @@ export const getPickedUpOrdersForRiderController = async (req, res) => {
 export const updateRiderStatusController = async (req, res) => {
   try {
     const { riderId } = req.params;
-    const { orderId, newStatus, pharmacyId } = req.body;  // PharmacyId is still being sent in the request
+    const { orderId, newStatus, pharmacyId } = req.body;
 
     const order = await Order.findById(orderId);
-    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (!order) return res.status(404).json({ message: "Order not found" });
 
     if (!order.assignedRider || order.assignedRider.toString() !== riderId) {
-      return res.status(403).json({ message: 'This order is not assigned to you' });
+      return res.status(403).json({ message: "This order is not assigned to you" });
     }
 
     const user = await User.findById(order.userId);
-    if (!user) return res.status(404).json({ message: 'User not found for the order' });
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    // 1. **Rider Rejected**:
-    if (newStatus === 'Rejected') {
+    // Helper: Update pharmacyResponses status if pharmacyId provided
+    const updatePharmacyStatus = (statusToSet) => {
+      if (!pharmacyId) return;
+
+      const pharmacyResponse = order.pharmacyResponses.find(
+        (response) => response.pharmacyId.toString() === pharmacyId
+      );
+
+      if (pharmacyResponse) {
+        pharmacyResponse.status = statusToSet;
+        pharmacyResponse.riderId = riderId;
+      }
+    };
+
+    // ====================================================
+    // 1️⃣ REJECTED
+    // ====================================================
+    if (newStatus === "Rejected") {
       if (!order.rejectedRiders) order.rejectedRiders = [];
+
       if (!order.rejectedRiders.includes(riderId)) {
         order.rejectedRiders.push(riderId);
       }
 
-      order.assignedRider = null; // Clear rider
-      order.assignedRiderStatus = 'Rejected';
-      order.status = 'Rejected';
+      order.assignedRider = null;
+      order.assignedRiderStatus = "Rejected";
+      order.status = "Rejected";
 
       order.statusTimeline.push({
         status: "Rejected",
@@ -1464,7 +1467,7 @@ export const updateRiderStatusController = async (req, res) => {
       user.notifications.push({
         orderId: order._id,
         status: "Rejected",
-        message: "Your order was rejected by the assigned rider. Searching for a new one...",
+        message: "Your order was rejected by the rider.",
         timestamp: new Date(),
         read: false,
       });
@@ -1472,54 +1475,30 @@ export const updateRiderStatusController = async (req, res) => {
       await user.save();
       await order.save();
 
-      res.status(200).json({ message: "Order rejected. Will try to reassign shortly." });
-
-      // Reassigning logic after rejection (as shown in the previous step)
-      setTimeout(async () => {
-        // Reassign logic remains the same
-      }, 30 * 1000); // 30 seconds
-
-      return;
+      return res.status(200).json({
+        message: "Order rejected successfully.",
+      });
     }
 
-    // 2. **Rider Accepted**: 
-    if (newStatus === 'Rider Accepted') {
-      // Check if the pharmacy accepted
-      if (!order.pharmacyResponses || !Array.isArray(order.pharmacyResponses)) {
-        return res.status(400).json({ message: 'Invalid pharmacy responses' });
-      }
+    // ====================================================
+    // 2️⃣ RIDER ACCEPTED
+    // ====================================================
+    if (newStatus === "Accepted") {
+      updatePharmacyStatus("Rider Accepted");
 
-      const pharmacyResponse = order.pharmacyResponses.find(
-        response => response.pharmacyId.toString() === pharmacyId
-      );
+      order.assignedRiderStatus = "Accepted";
+      order.status = "Rider Accepted";
 
-      if (!pharmacyResponse) {
-        return res.status(404).json({ message: 'Pharmacy not found in responses' });
-      }
-
-      // Update pharmacy response with Rider Accepted status
-      pharmacyResponse.status = 'Rider Accepted';
-      pharmacyResponse.riderId = riderId; // Rider who accepted the order
-
-      // If all pharmacies have accepted, update the order's status
-      const allPharmaciesAccepted = order.pharmacyResponses.every(
-        response => response.status === 'Rider Accepted'
-      );
-
-      if (allPharmaciesAccepted) {
-        order.assignedRiderStatus = 'Accepted';
-        order.status = 'Rider Accepted';
-        order.statusTimeline.push({
-          status: 'Rider Accepted',
-          message: `All pharmacies have accepted the order. Rider ${riderId} is now assigned.`,
-          timestamp: new Date(),
-        });
-      }
+      order.statusTimeline.push({
+        status: "Rider Accepted",
+        message: `Rider ${riderId} accepted the order.`,
+        timestamp: new Date(),
+      });
 
       user.notifications.push({
         orderId: order._id,
         status: "Rider Accepted",
-        message: `Your order has been accepted by the rider and is now being processed.`,
+        message: "Your order has been accepted by the rider.",
         timestamp: new Date(),
         read: false,
       });
@@ -1527,23 +1506,30 @@ export const updateRiderStatusController = async (req, res) => {
       await user.save();
       await order.save();
 
-      return res.status(200).json({ message: "Rider has accepted the order." });
+      return res.status(200).json({
+        message: "Order accepted by rider.",
+      });
     }
 
-    // 3. **Picked Up**: 
-    if (newStatus === 'Picked Up') {
-      order.assignedRiderStatus = 'Picked Up';
-      order.status = 'Picked Up';
+    // ====================================================
+    // 3️⃣ PICKED UP  ✅ (Corrected Name)
+    // ====================================================
+    if (newStatus === "PickedUp") {
+      updatePharmacyStatus("PickedUp");
+
+      order.assignedRiderStatus = "PickedUp";
+      order.status = "PickedUp";
+
       order.statusTimeline.push({
-        status: 'Picked Up',
-        message: `Rider ${riderId} has picked up the order.`,
+        status: "PickedUp",
+        message: `Rider ${riderId} picked up the order.`,
         timestamp: new Date(),
       });
 
       user.notifications.push({
         orderId: order._id,
-        status: "Picked Up",
-        message: `Your order has been picked up by the rider.`,
+        status: "PickedUp",
+        message: "Your order has been picked up by the rider.",
         timestamp: new Date(),
         read: false,
       });
@@ -1551,23 +1537,30 @@ export const updateRiderStatusController = async (req, res) => {
       await user.save();
       await order.save();
 
-      return res.status(200).json({ message: "Order picked up by the rider." });
+      return res.status(200).json({
+        message: "Order marked as PickedUp.",
+      });
     }
 
-    // 4. **Completed**: 
-    if (newStatus === 'Completed') {
-      order.assignedRiderStatus = 'Completed';
-      order.status = 'Completed';
+    // ====================================================
+    // 4️⃣ COMPLETED
+    // ====================================================
+    if (newStatus === "Completed") {
+      updatePharmacyStatus("Completed");
+
+      order.assignedRiderStatus = "Completed";
+      order.status = "Completed";
+
       order.statusTimeline.push({
-        status: 'Completed',
-        message: `Rider ${riderId} has delivered the order.`,
+        status: "Completed",
+        message: `Rider ${riderId} delivered the order.`,
         timestamp: new Date(),
       });
 
       user.notifications.push({
         orderId: order._id,
         status: "Completed",
-        message: `Your order has been delivered successfully.`,
+        message: "Your order has been delivered successfully.",
         timestamp: new Date(),
         read: false,
       });
@@ -1575,10 +1568,16 @@ export const updateRiderStatusController = async (req, res) => {
       await user.save();
       await order.save();
 
-      return res.status(200).json({ message: "Order completed and delivered to the user." });
+      return res.status(200).json({
+        message: "Order completed successfully.",
+      });
     }
 
-    // Default status update (for anything else like 'In Progress', etc.)
+    // ====================================================
+    // 5️⃣ DEFAULT STATUS UPDATE
+    // ====================================================
+    updatePharmacyStatus(newStatus);
+
     order.assignedRiderStatus = newStatus;
     order.status = newStatus;
 
@@ -1591,7 +1590,7 @@ export const updateRiderStatusController = async (req, res) => {
     user.notifications.push({
       orderId: order._id,
       status: newStatus,
-      message: `Your order status was updated to: ${newStatus}`,
+      message: `Your order status updated to ${newStatus}`,
       timestamp: new Date(),
       read: false,
     });
@@ -1599,11 +1598,15 @@ export const updateRiderStatusController = async (req, res) => {
     await user.save();
     await order.save();
 
-    return res.status(200).json({ message: `Order status updated to ${newStatus}` });
+    return res.status(200).json({
+      message: `Order status updated to ${newStatus}`,
+    });
 
   } catch (error) {
     console.error("Error updating rider status:", error);
-    return res.status(500).json({ message: 'Server error while updating rider status' });
+    return res.status(500).json({
+      message: "Server error while updating rider status",
+    });
   }
 };
 
@@ -1820,7 +1823,7 @@ export const getAllCompletedOrdersForRiderController = async (req, res) => {
     const completedOrders = await Order.find({
       assignedRider: riderId,
       assignedRiderStatus: 'Completed',
-      status: 'Delivered' // Order should be delivered
+      status: 'Completed' // Order should be delivered
     })
       .populate({
         path: 'orderItems.medicineId',
@@ -2096,31 +2099,41 @@ export const getRiderBankDetails = async (req, res) => {
 
 export const markOrderAsDeliveredController = async (req, res) => {
   try {
-    const { riderId, orderId } = req.params;
+    const { riderId, orderId } = req.params; // Removed pharmacyId
     const { collectedAmount, paymentMethodType } = req.body;
 
+    // ===============================
     // Validate IDs
+    // ===============================
     if (!mongoose.Types.ObjectId.isValid(riderId) || !mongoose.Types.ObjectId.isValid(orderId)) {
-      return res.status(400).json({ message: "Invalid rider ID or order ID" });
-    }
-
-    // Fetch order
-    const order = await Order.findById(orderId);
-    if (!order) return res.status(404).json({ message: "Order not found" });
-
-    // Validate rider assignment
-    if (order.assignedRider?.toString() !== riderId) {
-      return res.status(403).json({ message: "This order is not assigned to you" });
-    }
-
-    // Check delivery proof
-    if (!order.deliveryProof || order.deliveryProof.length === 0) {
       return res.status(400).json({
-        message: "Please upload delivery proof before marking the order as delivered.",
+        message: "Invalid rider ID or order ID",
       });
     }
 
-    // Handle COD (Cash on Delivery)
+    // ===============================
+    // Fetch Order
+    // ===============================
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    // Validate rider
+    if (order.assignedRider?.toString() !== riderId) {
+      return res.status(403).json({
+        message: "This order is not assigned to you",
+      });
+    }
+
+    // Delivery proof check
+    if (!order.deliveryProof || order.deliveryProof.length === 0) {
+      return res.status(400).json({
+        message: "Please upload delivery proof before marking delivered.",
+      });
+    }
+
+    // ===============================
+    // COD Handling
+    // ===============================
     if (order.paymentMethod === "Cash on Delivery") {
       if (!paymentMethodType || !["cash", "online"].includes(paymentMethodType)) {
         return res.status(400).json({
@@ -2130,13 +2143,12 @@ export const markOrderAsDeliveredController = async (req, res) => {
 
       if (collectedAmount === undefined || isNaN(collectedAmount)) {
         return res.status(400).json({
-          message: "Collected amount is required for all COD payments (cash or online).",
+          message: "Collected amount is required for COD payments.",
         });
       }
 
       const parsedAmount = parseFloat(collectedAmount);
 
-      // Store in DB
       order.collectedAmount = parsedAmount;
       order.codAmountReceived = parsedAmount;
       order.codPaymentMode = paymentMethodType;
@@ -2148,80 +2160,96 @@ export const markOrderAsDeliveredController = async (req, res) => {
       }
     }
 
-    // Fetch rider
+    // ===============================
+    // Fetch Rider
+    // ===============================
     const rider = await Rider.findById(riderId);
     if (!rider) return res.status(404).json({ message: "Rider not found" });
 
-    const deliveryCharge = parseFloat(order.deliveryCharge) || 0;  // Get delivery charge from the order
+    const deliveryCharge = parseFloat(order.deliveryCharge) || 0;
 
-    // Update order status to Delivered
-    order.status = "Delivered";
+    // ===============================
+    // 🔥 UPDATE ORDER STATUS
+    // ===============================
+    order.status = "Completed";
     order.paymentStatus = "Completed";
     order.assignedRiderStatus = "Completed";
 
-    // Add to status timeline
     order.statusTimeline.push({
-      status: "Delivered",
+      status: "Completed",
       message: `Order delivered by rider ${rider.name || riderId}`,
       timestamp: new Date(),
     });
 
-    // Add COD payment status if applicable
-    if (order.paymentMethod === "Cash on Delivery") {
-      order.statusTimeline.push({
-        status: "COD Collected",
-        message:
-          paymentMethodType === "cash"
-            ? `₹${collectedAmount} collected in cash by rider ${rider.name || riderId}`
-            : `₹${collectedAmount} received via UPI (QR scanned) by customer.`,
-        timestamp: new Date(),
+    // ===============================
+    // 🔥 UPDATE ALL PHARMACY RESPONSES
+    // ===============================
+    if (order.pharmacyResponses && Array.isArray(order.pharmacyResponses)) {
+      order.pharmacyResponses.forEach((response) => {
+        response.status = "Completed";
       });
     }
 
-    // Update rider wallet
-    rider.wallet += deliveryCharge;  // Add delivery charge to rider's wallet
+    // ===============================
+    // Rider Wallet Update
+    // ===============================
+    rider.wallet = (rider.wallet || 0) + deliveryCharge;
+
     rider.walletTransactions.push({
       amount: deliveryCharge,
       type: "credit",
+      orderId: order._id,
       createdAt: new Date(),
     });
 
+    // ===============================
+    // 🔥 Update All Pharmacies Wallet
+    // ===============================
+    if (order.pharmacyResponses?.length > 0) {
+      for (const response of order.pharmacyResponses) {
+        const pharmacy = await Pharmacy.findById(response.pharmacyId);
+        if (!pharmacy) continue;
 
-  // Update pharmacy wallet
-const pharmacy = await Pharmacy.findById(order.assignedPharmacy);
-if (pharmacy) {
-  let pharmacyEarning = 0;
+        let pharmacyEarning = 0;
 
-  for (const item of order.orderItems) {
-    const medicine = await Medicine.findById(item.medicineId);
-    if (!medicine) continue;
+        for (const item of order.orderItems) {
+          const medicine = await Medicine.findById(item.medicineId);
+          if (!medicine) continue;
 
-    pharmacyEarning += (medicine.price || 0) * (item.quantity || 0);
-  }
+          // If medicine belongs to this pharmacy
+          if (medicine.pharmacyId.toString() === pharmacy._id.toString()) {
+            pharmacyEarning += (medicine.price || 0) * (item.quantity || 0);
+          }
+        }
 
-  pharmacy.wallet = (pharmacy.wallet || 0) + pharmacyEarning;
-  pharmacy.walletTransactions.push({
-    amount: pharmacyEarning,
-    type: "credit",
-    orderId: order._id,
-    createdAt: new Date(),
-  });
+        pharmacy.wallet = (pharmacy.wallet || 0) + pharmacyEarning;
 
-  await pharmacy.save();
-}
+        pharmacy.walletTransactions.push({
+          amount: pharmacyEarning,
+          type: "credit",
+          orderId: order._id,
+          createdAt: new Date(),
+        });
 
+        await pharmacy.save();
+      }
+    }
 
-    // Save order and rider updates
+    // ===============================
+    // Save Order & Rider
+    // ===============================
     await Promise.all([order.save(), rider.save()]);
 
     return res.status(200).json({
-      message: "Order marked as delivered successfully",
-      updatedWallet: `₹${rider.wallet.toFixed(2)}`,  // Return the updated wallet balance
+      message: "Order marked as Completed successfully",
+      updatedWallet: `₹${rider.wallet.toFixed(2)}`,
     });
 
   } catch (error) {
     console.error("Error marking order as delivered:", error);
-    res.status(500).json({ message: "Server error while updating delivery status" });
+    return res.status(500).json({
+      message: "Server error while updating delivery status",
+    });
   }
 };
 
@@ -2610,16 +2638,19 @@ export const updateRiderLocation = async (req, res) => {
 
 export const uploadDeliveryProof = async (req, res) => {
   try {
-    const { riderId, orderId } = req.params;
+    const { riderId, orderId } = req.params; // Removed pharmacyId
 
-    // Check for uploaded image
+    // Validation: check uploaded image
     if (!req.files || !req.files.image) {
       return res.status(400).json({ message: "No image file uploaded" });
     }
 
     // Validate IDs
-    if (!mongoose.Types.ObjectId.isValid(riderId) || !mongoose.Types.ObjectId.isValid(orderId)) {
-      return res.status(400).json({ message: "Invalid rider ID or order ID" });
+    if (
+      !mongoose.Types.ObjectId.isValid(riderId) ||
+      !mongoose.Types.ObjectId.isValid(orderId)
+    ) {
+      return res.status(400).json({ message: "Invalid rider or order ID" });
     }
 
     // Find order
@@ -2639,7 +2670,7 @@ export const uploadDeliveryProof = async (req, res) => {
       folder: "order_delivery_proofs",
     });
 
-    // Push delivery proof into order
+    // Push delivery proof into order array (no pharmacyId)
     order.deliveryProof.push({
       riderId,
       imageUrl: uploadResponse.secure_url,
@@ -2655,13 +2686,14 @@ export const uploadDeliveryProof = async (req, res) => {
     });
   } catch (error) {
     console.error("🔥 Error in uploadDeliveryProof:", error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Server error",
+      message: "Server error while uploading delivery proof",
       error: error.message,
     });
   }
 };
+
 
 
 
@@ -2701,7 +2733,7 @@ export const createRiderQuery = async (req, res) => {
 
 export const uploadMedicineProof = async (req, res) => {
   try {
-    const { riderId, orderId } = req.params;
+    const { riderId, orderId, pharmacyId } = req.params; // ✅ pharmacyId added
 
     // Check for uploaded image
     if (!req.files || !req.files.image) {
@@ -2709,8 +2741,12 @@ export const uploadMedicineProof = async (req, res) => {
     }
 
     // Validate IDs
-    if (!mongoose.Types.ObjectId.isValid(riderId) || !mongoose.Types.ObjectId.isValid(orderId)) {
-      return res.status(400).json({ message: "Invalid rider ID or order ID" });
+    if (
+      !mongoose.Types.ObjectId.isValid(riderId) ||
+      !mongoose.Types.ObjectId.isValid(orderId) ||
+      !mongoose.Types.ObjectId.isValid(pharmacyId) // ✅ validate pharmacyId
+    ) {
+      return res.status(400).json({ message: "Invalid rider ID, order ID or pharmacy ID" });
     }
 
     // Find order
@@ -2730,15 +2766,15 @@ export const uploadMedicineProof = async (req, res) => {
     }
 
     const firstMedicineId = order.orderItems[0].medicineId;
-    
+
     // Find medicine details
     const medicine = await Medicine.findById(firstMedicineId);
     if (!medicine) {
       return res.status(404).json({ message: "Medicine not found" });
     }
 
-    // Find pharmacy details
-    const pharmacy = await Pharmacy.findById(medicine.pharmacyId);
+    // Use pharmacyId from params instead of first medicine
+    const pharmacy = await Pharmacy.findById(pharmacyId);
     if (!pharmacy) {
       return res.status(404).json({ message: "Pharmacy not found" });
     }
@@ -2798,7 +2834,7 @@ export const uploadMedicineProof = async (req, res) => {
       imageUrl: uploadResponse.secure_url,
       uploadedAt: new Date(),
       medicineId: firstMedicineId,
-      pharmacyId: medicine.pharmacyId
+      pharmacyId // ✅ use pharmacyId from params
     });
 
     await order.save();
@@ -2819,6 +2855,7 @@ export const uploadMedicineProof = async (req, res) => {
     });
   }
 };
+
 // // Helper function to calculate distance between two coordinates (Haversine formula)
 // function calculateDistance(lat1, lon1, lat2, lon2) {
 //   const R = 6371e3; // Earth's radius in meters
@@ -2836,3 +2873,75 @@ export const uploadMedicineProof = async (req, res) => {
 // }
 
 
+
+
+export const deleteRiderNotifications = async (req, res) => {
+  try {
+    const { riderId } = req.params;
+    const { notificationIds } = req.body; // single or array
+
+    // Validate riderId
+    if (!mongoose.Types.ObjectId.isValid(riderId)) {
+      return res.status(400).json({ message: "Invalid Rider ID" });
+    }
+
+    // Validate notificationIds
+    if (!notificationIds || 
+        (!Array.isArray(notificationIds) && typeof notificationIds !== "string")) {
+      return res.status(400).json({ message: "notificationIds must be a string or array of strings" });
+    }
+
+    const idsToDelete = Array.isArray(notificationIds) ? notificationIds : [notificationIds];
+
+    // Convert to ObjectId using 'new'
+    const objectIdsToDelete = idsToDelete.map(id => new mongoose.Types.ObjectId(id));
+
+    // Fetch Rider
+    const rider = await Rider.findById(riderId);
+    if (!rider) {
+      return res.status(404).json({ message: "Rider not found" });
+    }
+
+    // Filter out notifications
+    const beforeCount = rider.notifications.length;
+    rider.notifications = rider.notifications.filter(
+      notif => !objectIdsToDelete.some(id => id.equals(notif._id))
+    );
+    const afterCount = rider.notifications.length;
+
+    await rider.save();
+
+    return res.status(200).json({
+      message: "Notifications deleted successfully",
+      deletedCount: beforeCount - afterCount,
+      remainingNotifications: rider.notifications
+    });
+
+  } catch (error) {
+    console.error("Error deleting rider notifications:", error);
+    return res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+
+
+export const deleteRiderById = async (req, res) => {
+  const { riderId } = req.params;
+
+  try {
+    const rider = await Rider.findById(riderId);
+
+    if (!rider) {
+      return res.status(404).json({ message: "Rider not found" });
+    }
+
+    await Rider.findByIdAndDelete(riderId);
+
+    return res.status(200).json({
+      message: "Rider deleted successfully.",
+    });
+  } catch (error) {
+    console.error("Error deleting rider:", error);
+    return res.status(500).json({ message: "Something went wrong." });
+  }
+};

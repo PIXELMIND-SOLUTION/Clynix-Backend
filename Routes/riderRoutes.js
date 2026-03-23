@@ -1,6 +1,6 @@
 // router/riderRoutes.js or similar
 import express from "express";
-import {  addBankDetailsToRider, createRiderQuery, forgotPassword, getAcceptedOrdersForRiderController, getAllActiveOrdersForRiderController, getAllCompletedOrdersForRiderController, getNewOrdersForRiderController, getPickedUpOrdersForRiderController, getRiderBankDetails, getRiderDrivingLicense, getRiderEarningsGraph, getRiderNotifications, getRiderOrdersByStatus, getRiderOrderStats, getRiderProfile, getRiderWalletController, getSingleOrderForRiderController, getUpiInfo, loginRider, markOrderAsDeliveredController, signupRider, updateRiderLocation, updateRiderProfileImage, updateRiderStatus, updateRiderStatusController, uploadDeliveryProof, uploadMedicineProof, withdrawAmountFromWalletController,pharmacyPickupVerification } from "../Controller/RiderController.js";
+import {  addBankDetailsToRider, createRiderQuery, forgotPassword, getAcceptedOrdersForRiderController, getAllActiveOrdersForRiderController, getAllCompletedOrdersForRiderController, getNewOrdersForRiderController, getPickedUpOrdersForRiderController, getRiderBankDetails, getRiderDrivingLicense, getRiderEarningsGraph, getRiderNotifications, getRiderOrdersByStatus, getRiderOrderStats, getRiderProfile, getRiderWalletController, getSingleOrderForRiderController, getUpiInfo, loginRider, markOrderAsDeliveredController, signupRider, updateRiderLocation, updateRiderProfileImage, updateRiderStatus, updateRiderStatusController, uploadDeliveryProof, uploadMedicineProof, withdrawAmountFromWalletController,pharmacyPickupVerification, getAcceptedPharmacyOrdersForRiderController, deleteRiderNotifications, deleteRiderById } from "../Controller/RiderController.js";
 
 const router = express.Router();
 
@@ -9,6 +9,7 @@ router.get('/myprofile/:riderId', getRiderProfile);
 router.put('/updateprofileimage/:riderId', updateRiderProfileImage);
 router.get('/dashboard/:riderId', getRiderOrderStats);
 router.get('/neworders/:riderId', getNewOrdersForRiderController);
+router.get('/pendingacceptedorders/:riderId', getAcceptedPharmacyOrdersForRiderController);
 // SINGLE API
 router.post(
   '/rider/:riderId/order/:orderId/pharmacy/:pharmacyId/pickup-verify',
@@ -34,9 +35,12 @@ router.get("/earnings-graph/:riderId", getRiderEarningsGraph);
 router.get("/driving-license/:riderId", getRiderDrivingLicense);
 router.post('/update-location/:riderId', updateRiderLocation);
 router.post("/uploadDeliveryProof/:riderId/:orderId", uploadDeliveryProof);
-router.post('/upload-medicine-proof/:riderId/:orderId', uploadMedicineProof);
+router.post('/upload-medicine-proof/:riderId/:orderId/:pharmacyId', uploadMedicineProof);
 router.post('/createQuery', createRiderQuery);
 router.get('/upi-info', getUpiInfo);
+router.delete("/deletenotifications/:riderId", deleteRiderNotifications);
+
+router.delete('/delete-rider/:riderId', deleteRiderById);
 
 
 

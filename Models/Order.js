@@ -109,21 +109,22 @@ pharmacyEarning: { type: Number, default: 0 },
     total: { type: Number, min: 0 },  // or rename totalAmount to total
 
 
-    deliveryProof: [
-      {
-        riderId: {
-          type: mongoose.Schema.Types.ObjectId,
-          ref: "Rider", // Reference to the Rider model
-        },
-        imageUrl: {
-          type: String,
-        },
-        uploadedAt: {
-          type: Date,
-          default: Date.now,
-        },
-      },
-    ],
+deliveryProof: [
+  {
+    riderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Rider", // Reference to the Rider model
+    },
+    imageUrl: {
+      type: String,
+    },
+    uploadedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+],
+
     codAmountReceived: {
       type: Number,
       default: 0,
@@ -164,7 +165,7 @@ codPaymentMode: String, // e.g., 'cash' or 'online'
       },
       status: {
         type: String,
-        enum: ["Pending", "Accepted", "Rejected", "Rider Accepted"],
+        enum: ["Pending", "Accepted", "Rejected", "Rider Accepted", "PickedUp", "Completed"],
         default: "Pending"
       },
       respondedAt: Date
@@ -208,5 +209,7 @@ pickupProgress: [
   },
   { timestamps: true }
 );
+
+
 
 export default mongoose.model('Order', orderSchema);

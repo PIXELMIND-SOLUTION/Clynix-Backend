@@ -522,7 +522,7 @@ export const getInactivePharmacies = async (req, res) => {
 
     // If no inactive pharmacies found, return an appropriate message
     if (!inactivePharmacies || inactivePharmacies.length === 0) {
-      return res.status(404).json({
+      return res.status(200).json({
         message: "No inactive pharmacies found",
       });
     }
@@ -2042,7 +2042,7 @@ export const getAllPreodicOrders = async (req, res) => {
       .sort({ deliveryDate: -1 });  // Sort by deliveryDate descending
 
     if (orders.length === 0) {
-      return res.status(404).json({ message: "No periodic orders found" });
+      return res.status(200).json({ message: "No periodic orders found" });
     }
 
     res.status(200).json({

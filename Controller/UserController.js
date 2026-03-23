@@ -2534,3 +2534,48 @@ export const deleteUser = async (req, res) => {
     return res.status(500).json({ message: 'Something went wrong.' });
   }
 };
+
+
+// 1. Delete a single notification by ID
+export const deleteNotification = async (req, res) => {
+  try {
+    const { userId, notificationId } = req.params;
+
+    // Validate IDs
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID" });
+    }
+    if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+      return res.status(400).json({ message: "Invalid notification ID" });
+    }
+
+    // Find user and remove specific notification
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { 
+        $pull: { 
+          notifications: { _id: notificationId } 
+        } 
+      },
+      { new: true }
+    ).select('notifications');
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Notification deleted successfully",
+      remainingNotifications: user.notifications.length
+    });
+
+  } catch (error) {
+    console.error("Error deleting notification:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message
+    });
+  }
+};

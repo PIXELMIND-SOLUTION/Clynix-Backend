@@ -39,6 +39,7 @@ import {
      deleteAccount,
      confirmDeleteAccount,
      deleteUser,
+     deleteNotification,
     } from '../Controller/UserController.js'; // Import UserController
 const router = express.Router();
 
@@ -93,7 +94,7 @@ router.put("/cancelpreodicorder/:userId/:orderId", cancelPeriodicOrder);
 router.post('/deleteaccount', deleteAccount)
 router.get('/confirm-delete-account/:token', confirmDeleteAccount);
 router.delete('/delete-user/:userId', deleteUser);
-
+router.delete('/:userId/notifications/:notificationId', deleteNotification);
 
 
 

@@ -412,29 +412,48 @@ export const getAllOrdersByVendor = async (req, res) => {
   try {
     const { vendorId } = req.params;
 
-    // Find all orders assigned to this vendor pharmacy
-    const orders = await Order.find({ assignedPharmacy: vendorId })
+    // Find orders where this pharmacy is in the pharmacyResponses array
+    const orders = await Order.find({
+      'pharmacyResponses.pharmacyId': vendorId
+    })
       .populate("assignedRider")
+      .populate("userId", "name email mobile")
+      .populate({
+        path: 'orderItems.medicineId',
+        populate: {
+          path: 'pharmacyId',
+          select: 'name'
+        }
+      })
       .sort({ createdAt: -1 });
 
     return res.status(200).json({
       message: 'Orders fetched successfully',
-      orders: orders.map(order => ({
-        ...order.toObject(),
-        assignedRider: order.assignedRider ? {
-          _id: order.assignedRider._id,
-          name: order.assignedRider.name,
-          email: order.assignedRider.email,
-          phone: order.assignedRider.phone,
-          address: order.assignedRider.address,
-          city: order.assignedRider.city,
-          state: order.assignedRider.state,
-          pinCode: order.assignedRider.pinCode,
-          profileImage: order.assignedRider.profileImage,
-          rideImages: order.assignedRider.rideImages,
-          deliveryCharge: order.assignedRider.deliveryCharge,
-        } : null,
-      })),
+      orders: orders.map(order => {
+        const orderObj = order.toObject();
+        
+        // Filter order items to only show items from this vendor
+        orderObj.orderItems = orderObj.orderItems.filter(item => 
+          item.medicineId?.pharmacyId?._id?.toString() === vendorId
+        );
+        
+        return {
+          ...orderObj,
+          assignedRider: order.assignedRider ? {
+            _id: order.assignedRider._id,
+            name: order.assignedRider.name,
+            email: order.assignedRider.email,
+            phone: order.assignedRider.phone,
+            address: order.assignedRider.address,
+            city: order.assignedRider.city,
+            state: order.assignedRider.state,
+            pinCode: order.assignedRider.pinCode,
+            profileImage: order.assignedRider.profileImage,
+            rideImages: order.assignedRider.rideImages,
+            deliveryCharge: order.assignedRider.deliveryCharge,
+          } : null,
+        };
+      }).filter(order => order.orderItems.length > 0), // Only return orders that have items from this vendor
     });
   } catch (error) {
     console.error('Error fetching orders for vendor:', error);
@@ -462,77 +481,54 @@ export const updateOrderStatusByVendor = async (req, res) => {
     }
 
     const order = await Order.findById(orderId).populate("userId");
-    if (!order) {
-      return res.status(404).json({ message: "Order not found" });
-    }
+    if (!order) return res.status(404).json({ message: "Order not found" });
 
-    // Ensure pharmacyResponses is always initialized as an array
-    if (!order.pharmacyResponses) {
-      order.pharmacyResponses = [];
-    }
+    if (!order.pharmacyResponses) order.pharmacyResponses = [];
 
-    // Check if the vendor is part of the pharmacyResponses
     const pharmacyResponseIndex = order.pharmacyResponses.findIndex(
       (response) => response.pharmacyId.toString() === vendorId
     );
 
     if (pharmacyResponseIndex === -1) {
-      return res.status(403).json({
-        message: "Order not assigned to this pharmacy",
-      });
+      return res.status(403).json({ message: "Order not assigned to this pharmacy" });
     }
 
-    // =====================================================
-    // ❌ VENDOR REJECTS ORDER
-    // =====================================================
+    // =============================
+    // VENDOR REJECTS ORDER
+    // =============================
     if (status === "Rejected") {
-      // Update the pharmacy's response to "Rejected"
       order.pharmacyResponses[pharmacyResponseIndex].status = "Rejected";
       order.pharmacyResponses[pharmacyResponseIndex].respondedAt = new Date();
 
-      // Add pharmacy to rejectedPharmacies if not already there
+      if (!order.rejectedPharmacies) order.rejectedPharmacies = [];
       if (!order.rejectedPharmacies.includes(vendorId)) {
         order.rejectedPharmacies.push(vendorId);
       }
 
-      // Check if all pharmacies have rejected the order
-      const allRejected = order.pharmacyResponses.every(
-        (response) => response.status === "Rejected"
-      );
-
-      // If all pharmacies rejected the order, cancel the order
-      if (allRejected) {
-        order.status = "Cancelled";
-        order.statusTimeline.push({
-          status: "Cancelled",
-          message: "All pharmacies rejected the order",
-          timestamp: new Date(),
-        });
-      } else {
-        order.statusTimeline.push({
-          status: "Rejected",
-          message: `Pharmacy ${vendorId} rejected the order`,
-          timestamp: new Date(),
-        });
-      }
+      order.statusTimeline.push({
+        status: "Rejected",
+        message: `Pharmacy ${vendorId} rejected the order`,
+        timestamp: new Date(),
+      });
 
       await order.save();
 
+      // 🔥 30s me reassignment
+      scheduleReassignOrder(order._id);
+
       return res.status(200).json({
-        message: "Order rejected by pharmacy",
+        message: "Order rejected by pharmacy, will try to reassign.",
         order,
       });
     }
 
-    // =====================================================
-    // ✅ VENDOR ACCEPTS ORDER
-    // =====================================================
+    // =============================
+    // VENDOR ACCEPTS ORDER
+    // =============================
     if (status === "Accepted") {
-      // Update the pharmacy's response to "Accepted"
       order.pharmacyResponses[pharmacyResponseIndex].status = "Accepted";
       order.pharmacyResponses[pharmacyResponseIndex].respondedAt = new Date();
 
-      // Set overall pharmacyResponse status to "Accepted" if all pharmacies accept the order
       const allAccepted = order.pharmacyResponses.every(
         (response) => response.status === "Accepted"
       );
@@ -546,25 +542,18 @@ export const updateOrderStatusByVendor = async (req, res) => {
           timestamp: new Date(),
         });
 
-        // 🚴 ASSIGN A RIDER IF NOT ASSIGNED
+        // Rider assign only if ALL pharmacies accepted
         if (!order.assignedRider) {
           const riders = await Rider.find({ status: "online" });
-
           let nearestRider = null;
           let minDistance = Infinity;
 
           const userLat = order.userId.location?.coordinates[1];
           const userLng = order.userId.location?.coordinates[0];
 
-          // Loop through all available riders and find the nearest one
           for (const rider of riders) {
             if (!rider.latitude || !rider.longitude) continue;
-
-            const distance = calculateDistance(
-              [rider.longitude, rider.latitude],
-              [userLng, userLat]
-            );
-
+            const distance = calculateDistance([rider.longitude, rider.latitude], [userLng, userLat]);
             if (distance < minDistance) {
               minDistance = distance;
               nearestRider = rider;
@@ -576,8 +565,7 @@ export const updateOrderStatusByVendor = async (req, res) => {
             order.assignedRiderStatus = "Assigned";
 
             const baseFare = nearestRider.baseFare || 30;
-            order.deliveryCharge =
-              calculateDeliveryCharge(minDistance) + baseFare;
+            order.deliveryCharge = calculateDeliveryCharge(minDistance) + baseFare;
 
             order.statusTimeline.push({
               status: "Rider Assigned",
@@ -585,7 +573,6 @@ export const updateOrderStatusByVendor = async (req, res) => {
               timestamp: new Date(),
             });
 
-            // Notify the rider about the new assignment
             nearestRider.notifications.push({
               message: "New order assigned to you",
               orderId: order._id,
@@ -596,7 +583,7 @@ export const updateOrderStatusByVendor = async (req, res) => {
           }
         }
       } else {
-        order.pharmacyResponse = "Pending";  // Some pharmacies still pending
+        order.pharmacyResponse = "Pending";
         order.statusTimeline.push({
           status: "Pending",
           message: `Pharmacy ${vendorId} accepted the order`,
@@ -612,10 +599,9 @@ export const updateOrderStatusByVendor = async (req, res) => {
       });
     }
 
-    // =====================================================
-    // ℹ️ OTHER STATUS UPDATES
-    // =====================================================
-    // Update order status
+    // =============================
+    // OTHER STATUS UPDATE
+    // =============================
     order.status = status;
     order.statusTimeline.push({
       status,
@@ -629,53 +615,63 @@ export const updateOrderStatusByVendor = async (req, res) => {
       message: "Order status updated",
       order,
     });
+
   } catch (error) {
     console.error("updateOrderStatusByVendor error:", error);
-    return res.status(500).json({
-      message: "Server error",
-      error: error.message,
-    });
+    return res.status(500).json({ message: "Server error", error: error.message });
   }
 };
 
-
-
-const scheduleReassignOrder = (orderId) => {
+// =============================
+// REASSIGN ORDER AFTER 30s
+// =============================
+const scheduleReassignOrder = async (orderId) => {
   setTimeout(async () => {
     try {
       const order = await Order.findById(orderId);
-
       if (!order) return;
 
-      if (order.status === 'Accepted' || order.assignedPharmacy) return;
+      if (order.status === "Accepted" || order.status === "Cancelled") return;
 
       const rejectedPharmacies = order.rejectedPharmacies || [];
-      const availablePharmacies = await Pharmacy.find({
+
+      // Next available vendor
+      const nextPharmacy = await Pharmacy.findOne({
         _id: { $nin: rejectedPharmacies },
+        status: "active",
       });
 
-      if (availablePharmacies.length === 0) {
-        console.log('No pharmacies available to reassign the order:', orderId);
+      if (!nextPharmacy) {
+        order.status = "Cancelled";
+        order.statusTimeline.push({
+          status: "Cancelled",
+          message: "All pharmacies rejected. Order cancelled.",
+          timestamp: new Date(),
+        });
+        await order.save();
         return;
       }
 
-      const nextPharmacy = availablePharmacies[0];
-      order.assignedPharmacy = nextPharmacy._id;
-
+      // Assign new pharmacy
+      order.pharmacyResponses.push({
+        pharmacyId: nextPharmacy._id,
+        status: "Pending",
+        respondedAt: null,
+      });
       order.statusTimeline.push({
-        status: 'Reassigned',
-        message: `Order reassigned to pharmacy ${nextPharmacy._id} after rejection.`,
+        status: "Reassigned",
+        message: `Order reassigned to pharmacy ${nextPharmacy._id}`,
         timestamp: new Date(),
       });
 
       await order.save();
 
-      console.log(`Order ${orderId} reassigned to pharmacy ${nextPharmacy._id}`);
-    } catch (error) {
-      console.error('Error in scheduled reassignment:', error);
+    } catch (err) {
+      console.error("Error in reassignment:", err);
     }
-  }, 30 * 1000); // ⏱️ 30 seconds delay
+  }, 30 * 1000);
 };
+
 
 
 // Utility functions
@@ -942,7 +938,7 @@ export const getMessagesForVendor = async (req, res) => {
     .sort({ sentAt: -1 }); // Sort messages by sentAt in descending order
 
     if (messages.length === 0) {
-      return res.status(404).json({ message: "No messages found for this vendor" });
+      return res.status(200).json({ message: "No messages found for this vendor" });
     }
 
     // Clean the message data to only include message and sentAt
@@ -1252,12 +1248,24 @@ export const getPendingOrdersByVendor = async (req, res) => {
   try {
     const { vendorId } = req.params;
 
-    // Find orders assigned to this pharmacy AND with status "Pending"
+    // ✅ FIX: Correct query to find pending responses for this vendor
     const pendingOrders = await Order.find({
-      assignedPharmacy: vendorId,
-      status: 'Pending',
+      pharmacyResponses: {
+        $elemMatch: {
+          pharmacyId: vendorId,
+          status: 'Pending'
+        }
+      }
     })
       .populate("assignedRider")
+      .populate("userId", "name email mobile")
+      .populate({
+        path: 'orderItems.medicineId',
+        populate: {
+          path: 'pharmacyId',
+          select: 'name'
+        }
+      })
       .sort({ createdAt: -1 });
 
     return res.status(200).json({
@@ -1575,7 +1583,7 @@ export const getAllPeriodicOrdersByVendor = async (req, res) => {
       .sort({ deliveryDate: -1 }); // Sort orders by deliveryDate descending
 
     if (orders.length === 0) {
-      return res.status(404).json({ message: "No periodic orders found for this vendor" });
+      return res.status(200).json({ message: "No periodic orders found for this vendor" });
     }
 
     // Step 3: Send response with null-safe user check
@@ -1669,7 +1677,7 @@ export const getVendorQueries = async (req, res) => {
     const queries = await Query.find({ vendorId });
 
     if (!queries.length) {
-      return res.status(404).json({ message: "No queries found for this vendor" });
+      return res.status(200).json({ message: "No queries found for this vendor" });
     }
 
     // Send queries in response
