@@ -25,7 +25,7 @@ router.put('/editbankdetails/:vendorId/:bankDetailId', editBankDetails);
 router.get("/getprescriptions/:vendorId", getPrescriptionsForVendor);
 router.get('/pendingorders/:vendorId', getPendingOrdersByVendor);
 router.get('/deliveredorders/:vendorId', getDeliveredOrdersByVendor);
-router.post('/createOrderFromPrescription/:vendorId/:userId', createOrderFromPrescription);
+router.post('/createOrderFromPrescription/:prescriptionId/:vendorId/:userId', createOrderFromPrescription);
 router.patch('/updatePrescriptionStatus/:prescriptionId', updatePrescriptionStatus);
 router.get('/periodicorders/:vendorId', getAllPeriodicOrdersByVendor);
 router.get('/getPrescriptionOrdersByVendor/:vendorId', getPrescriptionOrdersByVendor);

@@ -621,36 +621,50 @@ export const getNearestPharmaciesByUser = async (req, res) => {
 
 // Distance calculator
 // Distance calculator
-// Distance calculation
+// Distance calculator - FIXED version
 const getDistanceInKm = (lat1, lon1, lat2, lon2) => {
+  // Validate inputs
+  if (isNaN(lat1) || isNaN(lon1) || isNaN(lat2) || isNaN(lon2)) {
+    console.error("Invalid coordinates:", { lat1, lon1, lat2, lon2 });
+    return 0;
+  }
+  
   const toRad = (value) => (value * Math.PI) / 180;
   const R = 6371; // Earth radius in km
+  
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+  
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * 
+            Math.sin(dLon / 2) ** 2;
+  
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const distance = R * c;
+  
+  // Log for debugging
+  console.log(`Distance calculated: ${distance}km between (${lat1},${lon1}) and (${lat2},${lon2})`);
+  
+  return distance;
 };
+
+
 
 export const addToCart = async function (req, res) {
   try {
     const { userId } = req.params;
     const { medicineId, quantity, inc, dec } = req.body;
 
-    // 1️⃣ Validate IDs
     if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(medicineId)) {
       return res.status(400).json({ message: "Invalid ID" });
     }
 
-    // 2️⃣ Fetch User
     const user = await User.findById(userId);
     if (!user || !user.location?.coordinates) {
       return res.status(404).json({ message: "User location not found" });
     }
     const [userLng, userLat] = user.location.coordinates;
 
-    // 3️⃣ Fetch Medicine + Pharmacy
     const medicine = await Medicine.findById(medicineId).populate("pharmacyId");
     if (!medicine) return res.status(404).json({ message: "Medicine not found" });
 
@@ -658,31 +672,41 @@ export const addToCart = async function (req, res) {
     const pharmacyLat = pharmacy.location.coordinates[1];
     const pharmacyLng = pharmacy.location.coordinates[0];
 
-    // 4️⃣ Calculate Distance & Delivery Charge
     const distanceKm = getDistanceInKm(userLat, userLng, pharmacyLat, pharmacyLng);
-    const rider = await Rider.findOne({ status: "online" });
-    const riderChargePerKm = rider?.deliveryCharge || 40;
-    const deliveryCharge = Math.round(distanceKm * riderChargePerKm);
+    
+    const nearestRider = await Rider.findOne({ 
+      status: "online",
+      drivingLicenseStatus: "Approved"
+    }).sort({ createdAt: -1 });
+    
+    const baseFare = nearestRider?.baseFare || 30;
+    const baseDistanceKm = nearestRider?.baseDistanceKm || 2;
+    const additionalChargePerKm = nearestRider?.additionalChargePerKm || 10;
+    
+    let deliveryCharge = baseFare;
+    let extraDistanceKm = 0;
+    let additionalCharge = 0;
+    
+    if (distanceKm > baseDistanceKm) {
+      extraDistanceKm = distanceKm - baseDistanceKm;
+      additionalCharge = extraDistanceKm * additionalChargePerKm;
+      deliveryCharge += additionalCharge;
+    }
+    
+    deliveryCharge = Math.round(deliveryCharge);
 
-    // 5️⃣ Fetch/Create Cart
     let cart = await Cart.findOne({ userId });
     if (!cart) cart = new Cart({ userId, items: [] });
 
-    // ✅ Remove single pharmacy restriction — no clearing cart
-
-    // 6️⃣ Add or Update Medicine in Cart
     const itemIndex = cart.items.findIndex((item) => item.medicineId.toString() === medicineId);
     const medMRP = Number(medicine.mrp) || 0;
 
     if (itemIndex > -1) {
-      // Medicine already in cart
       if (inc) cart.items[itemIndex].quantity += 1;
       else if (dec) cart.items[itemIndex].quantity = Math.max(1, cart.items[itemIndex].quantity - 1);
       else if (quantity) cart.items[itemIndex].quantity = Number(quantity) || 1;
-
       cart.items[itemIndex].mrp = medMRP;
     } else {
-      // Add new medicine
       cart.items.push({
         medicineId,
         quantity: Number(quantity) || 1,
@@ -694,7 +718,6 @@ export const addToCart = async function (req, res) {
       });
     }
 
-    // 7️⃣ Calculate Subtotal & Total
     let subTotal = 0;
     for (const item of cart.items) {
       const price = Number(item.mrp) || 0;
@@ -703,19 +726,27 @@ export const addToCart = async function (req, res) {
     }
 
     cart.subTotal = Number(subTotal.toFixed(2));
-    cart.platformFee = 10; // fixed
-    cart.deliveryCharge = deliveryCharge; // maybe you want to sum multiple pharmacies? For now, use last one
+    cart.platformFee = 10;
+    cart.deliveryCharge = deliveryCharge;
+    cart.deliveryChargeBreakdown = {
+      baseFare,
+      baseDistanceKm,
+      additionalChargePerKm,
+      distanceKm: Number(distanceKm.toFixed(2)),
+      extraDistanceKm: Number(extraDistanceKm.toFixed(2)),
+      additionalCharge: Number(additionalCharge.toFixed(2))
+    };
     cart.totalPayable = Number((cart.subTotal + cart.platformFee + cart.deliveryCharge).toFixed(2));
 
-    // 8️⃣ Save Cart
+    // ✅ Force save to ensure breakdown is stored
     await cart.save();
 
     return res.status(200).json({
       success: true,
       message: "Cart updated successfully",
-      distanceKm: Number(distanceKm.toFixed(2)),
       deliveryCharge,
-      cart,
+      deliveryChargeBreakdown: cart.deliveryChargeBreakdown,
+      cart: cart.toObject()
     });
   } catch (error) {
     console.error("Add to Cart Error:", error);
@@ -726,6 +757,208 @@ export const addToCart = async function (req, res) {
     });
   }
 };
+
+// Helper function to calculate distance between two points in kilometers
+function calculateDistanceBetweenPoints(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth's radius in kilometers
+  
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const distance = R * c;
+  
+  return distance;
+}
+// export const addToCart = async function (req, res) {
+//   try {
+//     const { userId } = req.params;
+//     const { medicineId, quantity, inc, dec } = req.body;
+
+//     // 1️⃣ Validate IDs
+//     if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(medicineId)) {
+//       return res.status(400).json({ message: "Invalid ID" });
+//     }
+
+//     // 2️⃣ Fetch User
+//     const user = await User.findById(userId);
+//     if (!user || !user.location?.coordinates) {
+//       return res.status(404).json({ message: "User location not found" });
+//     }
+//     const [userLng, userLat] = user.location.coordinates;
+
+//     // 3️⃣ Fetch Medicine + Pharmacy
+//     const medicine = await Medicine.findById(medicineId).populate("pharmacyId");
+//     if (!medicine) return res.status(404).json({ message: "Medicine not found" });
+
+//     const pharmacy = medicine.pharmacyId;
+//     const pharmacyLat = pharmacy.location.coordinates[1];
+//     const pharmacyLng = pharmacy.location.coordinates[0];
+
+//     // 4️⃣ Calculate Distance & Delivery Charge
+//     const distanceKm = getDistanceInKm(userLat, userLng, pharmacyLat, pharmacyLng);
+    
+//     // FIX: Get the base delivery charge from the system
+//     // For now, use a base delivery charge from settings or first rider
+//     let baseDeliveryCharge = 40; // Default
+    
+//     // Get the first active rider's delivery charge as base
+//     const activeRider = await Rider.findOne({ status: "online" });
+//     if (activeRider && activeRider.deliveryCharge) {
+//       baseDeliveryCharge = activeRider.deliveryCharge;
+//     }
+    
+//     // Calculate delivery charge based on distance
+//     const deliveryCharge = Math.round(distanceKm * baseDeliveryCharge);
+
+//     // 5️⃣ Fetch/Create Cart
+//     let cart = await Cart.findOne({ userId });
+//     if (!cart) cart = new Cart({ userId, items: [] });
+
+//     // 6️⃣ Add or Update Medicine in Cart
+//     const itemIndex = cart.items.findIndex((item) => item.medicineId.toString() === medicineId);
+//     const medMRP = Number(medicine.mrp) || 0;
+
+//     if (itemIndex > -1) {
+//       // Medicine already in cart
+//       if (inc) cart.items[itemIndex].quantity += 1;
+//       else if (dec) cart.items[itemIndex].quantity = Math.max(1, cart.items[itemIndex].quantity - 1);
+//       else if (quantity) cart.items[itemIndex].quantity = Number(quantity) || 1;
+
+//       cart.items[itemIndex].mrp = medMRP;
+//     } else {
+//       // Add new medicine
+//       cart.items.push({
+//         medicineId,
+//         quantity: Number(quantity) || 1,
+//         name: medicine.name,
+//         mrp: medMRP,
+//         images: medicine.images || [],
+//         description: medicine.description || "",
+//         pharmacy: pharmacy._id,
+//       });
+//     }
+
+//     // 7️⃣ Calculate Subtotal & Total
+//     let subTotal = 0;
+//     for (const item of cart.items) {
+//       const price = Number(item.mrp) || 0;
+//       const qty = Number(item.quantity) || 1;
+//       subTotal += price * qty;
+//     }
+
+//     cart.subTotal = Number(subTotal.toFixed(2));
+//     cart.platformFee = 10; // fixed
+    
+//     // CRITICAL FIX: Store the calculated delivery charge
+//     cart.deliveryCharge = deliveryCharge;
+//     cart.totalPayable = Number((cart.subTotal + cart.platformFee + cart.deliveryCharge).toFixed(2));
+
+//     // 8️⃣ Save Cart
+//     await cart.save();
+
+//     return res.status(200).json({
+//       success: true,
+//       message: "Cart updated successfully",
+//       distanceKm: Number(distanceKm.toFixed(2)),
+//       deliveryCharge: deliveryCharge, // Return the actual delivery charge
+//       cart: {
+//         ...cart.toObject(),
+//         deliveryCharge: cart.deliveryCharge // Ensure it's in the response
+//       }
+//     });
+//   } catch (error) {
+//     console.error("Add to Cart Error:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: "Server error",
+//       error: error.message,
+//     });
+//   }
+// };
+
+
+// export const getCart = async (req, res) => {
+//   try {
+//     const { userId } = req.params;
+
+//     if (!mongoose.Types.ObjectId.isValid(userId)) {
+//       return res.status(400).json({ message: 'Invalid user ID' });
+//     }
+
+//     const cart = await Cart.findOne({ userId })
+//       .populate({
+//         path: 'items.medicineId',
+//         select: 'name price images description pharmacyId mrp',
+//         populate: {
+//           path: 'pharmacyId',
+//           select: 'name location'
+//         }
+//       });
+
+//     if (!cart) {
+//       // If cart doesn't exist, return an empty response with zero values
+//       return res.status(200).json({
+//         message: 'Cart fetched successfully',
+//         cart: {
+//           items: [],
+//           totalItems: 0,
+//           subTotal: 0,
+//           platformFee: 0,
+//           deliveryCharge: 0,
+//           totalPayable: 0
+//         }
+//       });
+//     }
+
+//     const totalItems = cart.items.reduce((acc, item) => acc + item.quantity, 0);
+
+//     if (totalItems === 0) {
+//       // Cart exists but has no items, show everything as zero
+//       return res.status(200).json({
+//         message: 'Cart fetched successfully',
+//         cart: {
+//           items: [],
+//           totalItems: 0,
+//           subTotal: 0,
+//           platformFee: 0,
+//           deliveryCharge: 0,
+//           totalPayable: 0
+//         }
+//       });
+//     }
+
+//     // Items exist in the cart, return with the correct values
+//     return res.status(200).json({
+//       message: 'Cart fetched successfully',
+//       cart: {
+//         items: cart.items.map(item => ({
+//           medicineId: item.medicineId._id,
+//           name: item.medicineId.name,
+//           mrp: item.medicineId.mrp,
+//           images: item.medicineId.images,
+//           description: item.medicineId.description,
+//           pharmacy: item.medicineId.pharmacyId,
+//           quantity: item.quantity,
+//           totalPrice: item.medicineId.mrp * item.quantity
+//         })),
+//         totalItems,
+//         subTotal: cart.subTotal,
+//         platformFee: 10,  // Static platform fee, same for all orders
+//         deliveryCharge: cart.deliveryCharge,  // Use the calculated delivery charge from the cart
+//         totalPayable: cart.subTotal + 10 + cart.deliveryCharge  // Add platformFee and deliveryCharge to total
+//       }
+//     });
+
+//   } catch (error) {
+//     console.error('Get Cart Error:', error);
+//     return res.status(500).json({ message: 'Server error', error: error.message });
+//   }
+// };
 
 
 export const getCart = async (req, res) => {
@@ -747,7 +980,6 @@ export const getCart = async (req, res) => {
       });
 
     if (!cart) {
-      // If cart doesn't exist, return an empty response with zero values
       return res.status(200).json({
         message: 'Cart fetched successfully',
         cart: {
@@ -756,6 +988,14 @@ export const getCart = async (req, res) => {
           subTotal: 0,
           platformFee: 0,
           deliveryCharge: 0,
+          deliveryChargeBreakdown: {
+            baseFare: 0,
+            baseDistanceKm: 0,
+            additionalChargePerKm: 0,
+            distanceKm: 0,
+            extraDistanceKm: 0,
+            additionalCharge: 0
+          },
           totalPayable: 0
         }
       });
@@ -764,7 +1004,6 @@ export const getCart = async (req, res) => {
     const totalItems = cart.items.reduce((acc, item) => acc + item.quantity, 0);
 
     if (totalItems === 0) {
-      // Cart exists but has no items, show everything as zero
       return res.status(200).json({
         message: 'Cart fetched successfully',
         cart: {
@@ -773,12 +1012,19 @@ export const getCart = async (req, res) => {
           subTotal: 0,
           platformFee: 0,
           deliveryCharge: 0,
+          deliveryChargeBreakdown: {
+            baseFare: 0,
+            baseDistanceKm: 0,
+            additionalChargePerKm: 0,
+            distanceKm: 0,
+            extraDistanceKm: 0,
+            additionalCharge: 0
+          },
           totalPayable: 0
         }
       });
     }
 
-    // Items exist in the cart, return with the correct values
     return res.status(200).json({
       message: 'Cart fetched successfully',
       cart: {
@@ -794,9 +1040,10 @@ export const getCart = async (req, res) => {
         })),
         totalItems,
         subTotal: cart.subTotal,
-        platformFee: 10,  // Static platform fee, same for all orders
-        deliveryCharge: cart.deliveryCharge,  // Use the calculated delivery charge from the cart
-        totalPayable: cart.subTotal + 10 + cart.deliveryCharge  // Add platformFee and deliveryCharge to total
+        platformFee: 10,
+        deliveryCharge: cart.deliveryCharge,
+        deliveryChargeBreakdown: cart.deliveryChargeBreakdown,
+        totalPayable: cart.totalPayable
       }
     });
 
@@ -805,7 +1052,6 @@ export const getCart = async (req, res) => {
     return res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
-
 
 
 
@@ -925,12 +1171,157 @@ export const getAddresses = async (req, res) => {
 
 
 
+// export const createBookingFromCart = async (req, res) => {
+//   try {
+//     const { userId } = req.params;
+//     const { addressId, notes, voiceNoteUrl, paymentMethod, transactionId, couponCode } = req.body;
+
+//     // ---------------- VALIDATION ----------------
+//     if (!mongoose.Types.ObjectId.isValid(userId)) {
+//       return res.status(400).json({ message: "Invalid user ID" });
+//     }
+//     if (!mongoose.Types.ObjectId.isValid(addressId)) {
+//       return res.status(400).json({ message: "Invalid address ID" });
+//     }
+
+//     const user = await User.findById(userId);
+//     if (!user) return res.status(404).json({ message: "User not found" });
+
+//     const deliveryAddress = user.myAddresses.id(addressId);
+//     if (!deliveryAddress) return res.status(404).json({ message: "Address not found" });
+
+//     // ---------------- CART ----------------
+//     const cart = await Cart.findOne({ userId }).populate({
+//       path: "items.medicineId",
+//       select: "name mrp images description pharmacyId",
+//     });
+
+//     if (!cart || cart.items.length === 0) return res.status(400).json({ message: "Cart is empty" });
+
+//     const orderItems = cart.items.map((item) => ({
+//       medicineId: item.medicineId._id,
+//       name: item.medicineId.name,
+//       quantity: item.quantity,
+//       price: item.mrp,
+//       images: item.medicineId.images,
+//       description: item.medicineId.description,
+//       pharmacy: item.medicineId.pharmacyId,
+//     }));
+
+//     let { subTotal, deliveryCharge } = cart;
+//     const platformFee = 10;
+//     let totalPayable = subTotal + platformFee + deliveryCharge;
+
+//     // ---------------- COUPON ----------------
+//     let discountAmount = 0;
+//     if (couponCode) {
+//       const coupon = await Coupon.findOne({ couponCode });
+//       if (!coupon) return res.status(400).json({ message: "Invalid coupon code" });
+//       if (coupon.expirationDate < new Date()) return res.status(400).json({ message: "Coupon has expired" });
+
+//       discountAmount = (subTotal * coupon.discountPercentage) / 100;
+//       totalPayable = Math.max(0, totalPayable - discountAmount);
+
+//       orderItems.push({
+//         name: `Coupon Discount (${couponCode})`,
+//         price: -discountAmount,
+//         quantity: 1,
+//       });
+//     }
+
+//     // ---------------- PAYMENT ----------------
+//     let paymentStatus = "Pending";
+//     let verifiedPaymentDetails = null;
+
+//     if (paymentMethod !== "Cash on Delivery") {
+//       if (!transactionId) return res.status(400).json({ message: "Transaction ID required for non-COD payments" });
+
+//       const paymentInfo = await razorpay.payments.fetch(transactionId);
+//       if (!paymentInfo) return res.status(404).json({ message: "Payment not found" });
+
+//       if (paymentInfo.status === "authorized") {
+//         await razorpay.payments.capture(transactionId, totalPayable * 100, "INR");
+//       }
+
+//       verifiedPaymentDetails = await razorpay.payments.fetch(transactionId);
+//       if (verifiedPaymentDetails.status !== "captured") return res.status(400).json({ message: "Payment not captured" });
+
+//       paymentStatus = "Captured";
+//     }
+
+//     // ---------------- ASSIGNED PHARMACIES ----------------
+//     const pharmacyIds = [...new Set(orderItems.map((item) => item.pharmacy.toString()))];
+
+//     // ---------------- CREATE ORDER ----------------
+//     let newOrder = new Order({
+//       userId,
+//       deliveryAddress,
+//       orderItems,
+//       subTotal,
+//       platformFee,
+//       deliveryCharge,
+//       totalAmount: totalPayable,
+//       couponCode: couponCode || null,
+//       discountAmount,
+//       notes: notes || "",
+//       voiceNoteUrl: voiceNoteUrl || "",
+//       paymentMethod,
+//       paymentStatus,
+//       status: "Pending",
+//       statusTimeline: [{ status: "Pending", message: "Order placed", timestamp: new Date() }],
+//       pharmacyResponse: "Pending",  // Set initial pharmacyResponse to Pending
+//       pharmacyResponses: pharmacyIds.map(pharmacyId => ({
+//         pharmacyId: pharmacyId,
+//         status: "Pending",  // Each pharmacy's response is initially Pending
+//         respondedAt: null
+//       })),
+//       rejectedPharmacies: [],
+//       razorpayOrder: verifiedPaymentDetails,
+//     });
+
+//     newOrder = await newOrder.save();
+
+//     // ---------------- CLEAR CART ----------------
+//     cart.items = [];
+//     cart.subTotal = 0;
+//     cart.deliveryCharge = 0;
+//     await cart.save();
+
+//     // ---------------- POPULATE FOR RESPONSE ----------------
+//     const populatedOrder = await newOrder.populate([
+//       { path: "userId", select: "name email" },
+//       { path: "orderItems.medicineId", select: "name images description" },
+//     ]);
+
+//     // ---------------- SEND RESPONSE ----------------
+//     const orderToSend = populatedOrder.toObject();
+//     delete orderToSend.transactionId; // sensitive
+//     delete orderToSend.razorpayOrder; // sensitive
+
+//     return res.status(201).json({
+//       success: true,
+//       message: "Order placed successfully",
+//       order: orderToSend,
+//     });
+
+//   } catch (error) {
+//     console.error("createBookingFromCart Error:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: "Server Error",
+//       error: error.message,
+//     });
+//   }
+// };
+
+
+
+
 export const createBookingFromCart = async (req, res) => {
   try {
     const { userId } = req.params;
     const { addressId, notes, voiceNoteUrl, paymentMethod, transactionId, couponCode } = req.body;
 
-    // ---------------- VALIDATION ----------------
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ message: "Invalid user ID" });
     }
@@ -944,13 +1335,26 @@ export const createBookingFromCart = async (req, res) => {
     const deliveryAddress = user.myAddresses.id(addressId);
     if (!deliveryAddress) return res.status(404).json({ message: "Address not found" });
 
-    // ---------------- CART ----------------
     const cart = await Cart.findOne({ userId }).populate({
       path: "items.medicineId",
-      select: "name mrp images description pharmacyId",
+      populate: {
+        path: "pharmacyId",
+        select: "_id name location latitude longitude vendorPhone address image"
+      }
     });
 
     if (!cart || cart.items.length === 0) return res.status(400).json({ message: "Cart is empty" });
+
+    // ✅ CRITICAL: Store these values BEFORE any modifications
+    const deliveryCharge = cart.deliveryCharge;
+    const subTotal = cart.subTotal;
+    const platformFee = cart.platformFee;
+    const totalPayable = cart.totalPayable;
+    const deliveryChargeBreakdown = cart.deliveryChargeBreakdown; // Save this!
+
+    console.log("🔍 DEBUG - Cart values:");
+    console.log("  - deliveryCharge:", deliveryCharge);
+    console.log("  - deliveryChargeBreakdown:", JSON.stringify(deliveryChargeBreakdown, null, 2));
 
     const orderItems = cart.items.map((item) => ({
       medicineId: item.medicineId._id,
@@ -959,103 +1363,107 @@ export const createBookingFromCart = async (req, res) => {
       price: item.mrp,
       images: item.medicineId.images,
       description: item.medicineId.description,
-      pharmacy: item.medicineId.pharmacyId,
+      pharmacy: item.medicineId.pharmacyId?._id,
     }));
 
-    let { subTotal, deliveryCharge } = cart;
-    const platformFee = 10;
-    let totalPayable = subTotal + platformFee + deliveryCharge;
+    const pharmacyIds = [...new Set(orderItems.filter(i => i.pharmacy).map(i => i.pharmacy.toString()))];
 
-    // ---------------- COUPON ----------------
     let discountAmount = 0;
+    let finalTotalPayable = totalPayable;
+    
     if (couponCode) {
       const coupon = await Coupon.findOne({ couponCode });
-      if (!coupon) return res.status(400).json({ message: "Invalid coupon code" });
-      if (coupon.expirationDate < new Date()) return res.status(400).json({ message: "Coupon has expired" });
-
-      discountAmount = (subTotal * coupon.discountPercentage) / 100;
-      totalPayable = Math.max(0, totalPayable - discountAmount);
-
-      orderItems.push({
-        name: `Coupon Discount (${couponCode})`,
-        price: -discountAmount,
-        quantity: 1,
-      });
+      if (coupon && coupon.expirationDate >= new Date()) {
+        discountAmount = (subTotal * coupon.discountPercentage) / 100;
+        finalTotalPayable = Math.max(0, totalPayable - discountAmount);
+      }
     }
 
-    // ---------------- PAYMENT ----------------
     let paymentStatus = "Pending";
     let verifiedPaymentDetails = null;
 
     if (paymentMethod !== "Cash on Delivery") {
-      if (!transactionId) return res.status(400).json({ message: "Transaction ID required for non-COD payments" });
-
-      const paymentInfo = await razorpay.payments.fetch(transactionId);
-      if (!paymentInfo) return res.status(404).json({ message: "Payment not found" });
-
-      if (paymentInfo.status === "authorized") {
-        await razorpay.payments.capture(transactionId, totalPayable * 100, "INR");
+      if (!transactionId) return res.status(400).json({ message: "Transaction ID required" });
+      try {
+        const paymentInfo = await razorpay.payments.fetch(transactionId);
+        if (paymentInfo.status === "authorized") {
+          await razorpay.payments.capture(transactionId, finalTotalPayable * 100, "INR");
+        }
+        verifiedPaymentDetails = await razorpay.payments.fetch(transactionId);
+        if (verifiedPaymentDetails.status !== "captured") {
+          return res.status(400).json({ message: "Payment not captured" });
+        }
+        paymentStatus = "Captured";
+      } catch (error) {
+        return res.status(400).json({ message: "Payment verification failed" });
       }
-
-      verifiedPaymentDetails = await razorpay.payments.fetch(transactionId);
-      if (verifiedPaymentDetails.status !== "captured") return res.status(400).json({ message: "Payment not captured" });
-
-      paymentStatus = "Captured";
     }
 
-    // ---------------- ASSIGNED PHARMACIES ----------------
-    const pharmacyIds = [...new Set(orderItems.map((item) => item.pharmacy.toString()))];
-
-    // ---------------- CREATE ORDER ----------------
-    let newOrder = new Order({
+    // ✅ Create order with EXACT values from cart
+    const newOrder = new Order({
       userId,
       deliveryAddress,
       orderItems,
-      subTotal,
-      platformFee,
-      deliveryCharge,
-      totalAmount: totalPayable,
+      subTotal: subTotal,
+      platformFee: platformFee,
+      deliveryCharge: deliveryCharge, // ✅ This should be 4105
+      totalAmount: finalTotalPayable,
       couponCode: couponCode || null,
       discountAmount,
       notes: notes || "",
       voiceNoteUrl: voiceNoteUrl || "",
       paymentMethod,
       paymentStatus,
+      transactionId: transactionId || null,
       status: "Pending",
+      deliveryChargeBreakdown: deliveryChargeBreakdown, // ✅ Save the breakdown
       statusTimeline: [{ status: "Pending", message: "Order placed", timestamp: new Date() }],
-      pharmacyResponse: "Pending",  // Set initial pharmacyResponse to Pending
       pharmacyResponses: pharmacyIds.map(pharmacyId => ({
         pharmacyId: pharmacyId,
-        status: "Pending",  // Each pharmacy's response is initially Pending
+        status: "Pending",
         respondedAt: null
       })),
-      rejectedPharmacies: [],
-      razorpayOrder: verifiedPaymentDetails,
     });
 
-    newOrder = await newOrder.save();
+    // ✅ Save order
+    await newOrder.save();
 
-    // ---------------- CLEAR CART ----------------
+    console.log("✅ ORDER SAVED WITH:");
+    console.log("  - deliveryCharge:", newOrder.deliveryCharge);
+    console.log("  - deliveryChargeBreakdown:", JSON.stringify(newOrder.deliveryChargeBreakdown, null, 2));
+
+    // Notify pharmacies
+    for (const pharmacyId of pharmacyIds) {
+      const pharmacy = await Pharmacy.findById(pharmacyId);
+      if (pharmacy) {
+        pharmacy.notifications = pharmacy.notifications || [];
+        pharmacy.notifications.push({
+          orderId: newOrder._id,
+          status: "Pending",
+          message: `New order #${newOrder._id.toString().slice(-6)} placed by ${user.name}`,
+          timestamp: new Date(),
+          read: false
+        });
+        await pharmacy.save();
+      }
+    }
+
+    // Clear cart
     cart.items = [];
     cart.subTotal = 0;
     cart.deliveryCharge = 0;
+    cart.deliveryChargeBreakdown = {};
     await cart.save();
 
-    // ---------------- POPULATE FOR RESPONSE ----------------
     const populatedOrder = await newOrder.populate([
-      { path: "userId", select: "name email" },
+      { path: "userId", select: "name email mobile" },
       { path: "orderItems.medicineId", select: "name images description" },
     ]);
-
-    // ---------------- SEND RESPONSE ----------------
-    const orderToSend = populatedOrder.toObject();
-    delete orderToSend.transactionId; // sensitive
-    delete orderToSend.razorpayOrder; // sensitive
 
     return res.status(201).json({
       success: true,
       message: "Order placed successfully",
-      order: orderToSend,
+      order: populatedOrder
     });
 
   } catch (error) {
@@ -1067,6 +1475,8 @@ export const createBookingFromCart = async (req, res) => {
     });
   }
 };
+
+
 
 
 export const getMyBookings = async (req, res) => {
@@ -1997,64 +2407,105 @@ export const getUserPeriodicOrders = async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Fetch only periodic (subscription) orders
+    // Fetch orders with planType (periodic orders)
     const orders = await Order.find({
       userId,
-      planType: { $exists: true, $ne: null, $ne: "" },
+      planType: { $exists: true, $ne: null, $in: ["Weekly", "Monthly"] }
     })
-      .populate("assignedRider", "name phone")
-      .populate("assignedPharmacy", "name phone email")
-      .sort({ deliveryDate: -1 })
-      .lean(); // convert to plain JS object (removes Mongoose metadata)
+      .populate("assignedRider", "name phone email")
+      .populate("orderByVendor", "name phone email") // Changed from assignedPharmacy to orderByVendor
+      .sort({ createdAt: -1 })
+      .lean();
 
-    if (!orders.length) {
-      return res.status(200).json({ success: true, count: 0, orders: [] });
+    if (!orders || orders.length === 0) {
+      return res.status(200).json({ 
+        success: true, 
+        count: 0, 
+        orders: [] 
+      });
     }
 
     // Process each order
     const formattedOrders = await Promise.all(
       orders.map(async (order) => {
+        // Process order items with medicine details
         const orderItems = await Promise.all(
           order.orderItems.map(async (item) => {
-            const med = await Medicine.findById(item.medicineId).lean();
+            // If item has medicineId, fetch medicine details
+            if (item.medicineId) {
+              const med = await Medicine.findById(item.medicineId).lean();
+              return {
+                _id: item._id,
+                medicineId: item.medicineId,
+                name: item.name || med?.name || "Medicine",
+                quantity: item.quantity,
+                price: item.price || med?.mrp || 0,
+                image: med?.images && med.images.length > 0 ? med.images[0] : null,
+              };
+            }
+            // For non-medicine items like coupon discounts
             return {
               _id: item._id,
-              medicineId: item.medicineId,
-              name: item.name || med?.name,
+              medicineId: null,
+              name: item.name || "Item",
               quantity: item.quantity,
-              image:
-                med?.images?.length > 0
-                  ? med.images[0]
-                  : "/default-image.jpg",
+              price: item.price || 0,
+              image: null,
             };
           })
         );
 
-        const deliveryDate =
-          order.deliveryDate && !isNaN(new Date(order.deliveryDate))
-            ? new Date(order.deliveryDate).toISOString().split("T")[0]
-            : null;
+        // Format delivery date
+        let deliveryDate = null;
+        if (order.deliveryDate) {
+          const date = new Date(order.deliveryDate);
+          if (!isNaN(date.getTime())) {
+            deliveryDate = date.toISOString().split("T")[0];
+          }
+        }
+
+        // If no deliveryDate but order has createdAt, use that
+        if (!deliveryDate && order.createdAt) {
+          const date = new Date(order.createdAt);
+          if (!isNaN(date.getTime())) {
+            deliveryDate = date.toISOString().split("T")[0];
+          }
+        }
+
+        // Get pharmacy response status
+        let pharmacyResponseStatus = "Pending";
+        if (order.pharmacyResponses && order.pharmacyResponses.length > 0) {
+          // Check if any pharmacy accepted
+          const accepted = order.pharmacyResponses.some(r => r.status === "Accepted");
+          const rejected = order.pharmacyResponses.some(r => r.status === "Rejected");
+          
+          if (accepted) pharmacyResponseStatus = "Accepted";
+          else if (rejected) pharmacyResponseStatus = "Rejected";
+          else pharmacyResponseStatus = "Pending";
+        }
 
         return {
           _id: order._id,
-          planType: order.planType,
+          planType: order.planType || "One-time",
           deliveryDate,
-          deliveryAddress: order.deliveryAddress,
+          deliveryAddress: order.deliveryAddress || null,
           orderItems,
-          subTotal: order.subTotal,
-          totalAmount: order.totalAmount,
-          platformFee: order.platformFee || order.platformCharge || 0,
+          subTotal: order.subtotal || order.subTotal || 0,
+          totalAmount: order.totalAmount || order.total || 0,
+          platformFee: order.platformFee || 0,
           deliveryCharge: order.deliveryCharge || 0,
           discountAmount: order.discountAmount || 0,
           couponCode: order.couponCode || null,
-          paymentMethod: order.paymentMethod,
-          paymentStatus: order.paymentStatus,
-          status: order.status,
-          pharmacy: order.assignedPharmacy
+          paymentMethod: order.paymentMethod || "Cash on Delivery",
+          paymentStatus: order.paymentStatus || "Pending",
+          status: order.status || "Pending",
+          pharmacyResponse: pharmacyResponseStatus,
+          pharmacy: order.orderByVendor
             ? {
-                _id: order.assignedPharmacy._id,
-                name: order.assignedPharmacy.name,
-                phone: order.assignedPharmacy.phone,
+                _id: order.orderByVendor._id,
+                name: order.orderByVendor.name,
+                phone: order.orderByVendor.phone,
+                email: order.orderByVendor.email,
               }
             : null,
           rider: order.assignedRider
@@ -2062,10 +2513,12 @@ export const getUserPeriodicOrders = async (req, res) => {
                 _id: order.assignedRider._id,
                 name: order.assignedRider.name,
                 phone: order.assignedRider.phone,
+                email: order.assignedRider.email,
               }
             : null,
-          notes: order.notes,
-          voiceNoteUrl: order.voiceNoteUrl,
+          notes: order.notes || "",
+          voiceNoteUrl: order.voiceNoteUrl || null,
+          statusTimeline: order.statusTimeline || [],
           createdAt: order.createdAt,
           updatedAt: order.updatedAt,
         };
@@ -2077,11 +2530,14 @@ export const getUserPeriodicOrders = async (req, res) => {
       count: formattedOrders.length,
       orders: formattedOrders,
     });
+
   } catch (error) {
     console.error("Error fetching user periodic orders:", error);
-    return res
-      .status(500)
-      .json({ message: "Server error", error: error.message });
+    return res.status(500).json({ 
+      success: false,
+      message: "Server error", 
+      error: error.message 
+    });
   }
 };
 
@@ -2576,6 +3032,115 @@ export const deleteNotification = async (req, res) => {
       success: false,
       message: "Server error",
       error: error.message
+    });
+  }
+};
+
+export const bulkDeleteNotifications = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { notificationIds } = req.body;
+
+    console.log('=== Bulk Delete Request ===');
+    console.log('User ID:', userId);
+    console.log('Notification IDs to delete:', notificationIds);
+
+    // Validate userId
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Invalid user ID" 
+      });
+    }
+
+    // Validate notificationIds
+    if (!notificationIds || !Array.isArray(notificationIds) || notificationIds.length === 0) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Please provide an array of notification IDs to delete" 
+      });
+    }
+
+    // Find user with notifications
+    const user = await User.findById(userId);
+    
+    if (!user) {
+      return res.status(404).json({ 
+        success: false,
+        message: "User not found" 
+      });
+    }
+
+    console.log('Total notifications before deletion:', user.notifications.length);
+    
+    if (user.notifications.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No notifications to delete",
+        deletedCount: 0,
+        remainingCount: 0
+      });
+    }
+
+    // Log all existing notification IDs for debugging
+    const existingIds = user.notifications.map(n => n._id.toString());
+    console.log('Existing notification IDs:', existingIds);
+    console.log('IDs trying to delete:', notificationIds);
+
+    // Find which IDs exist and which don't
+    const existingToDelete = notificationIds.filter(id => existingIds.includes(id));
+    const nonExistingIds = notificationIds.filter(id => !existingIds.includes(id));
+
+    console.log('IDs that exist:', existingToDelete);
+    console.log('IDs that do not exist:', nonExistingIds);
+
+    if (existingToDelete.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "None of the provided notification IDs exist for this user",
+        nonExistingIds: nonExistingIds,
+        existingIdsInUser: existingIds,
+        hint: "Please check the notification IDs - they may belong to a different user or have been already deleted"
+      });
+    }
+
+    // Convert IDs to ObjectId for MongoDB query
+    const objectIdsToDelete = existingToDelete.map(id => new mongoose.Types.ObjectId(id));
+
+    // Perform the deletion
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { 
+        $pull: { 
+          notifications: { _id: { $in: objectIdsToDelete } } 
+        } 
+      },
+      { new: true }
+    );
+
+    const deletedCount = existingToDelete.length;
+    const remainingCount = updatedUser.notifications.length;
+
+    console.log(`Successfully deleted ${deletedCount} notifications`);
+    console.log(`Remaining notifications: ${remainingCount}`);
+
+    return res.status(200).json({
+      success: true,
+      message: `${deletedCount} notification(s) deleted successfully`,
+      deletedCount: deletedCount,
+      nonExistingCount: nonExistingIds.length,
+      nonExistingIds: nonExistingIds.length > 0 ? nonExistingIds : undefined,
+      remainingCount: remainingCount,
+      remainingNotificationIds: updatedUser.notifications.map(n => n._id.toString())
+    });
+
+  } catch (error) {
+    console.error("Error in bulk delete notifications:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 };

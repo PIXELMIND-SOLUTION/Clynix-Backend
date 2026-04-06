@@ -51,7 +51,12 @@ const riderSchema = new mongoose.Schema(
       enum: ["online", "offline"],
       default: "online", // Default status is online
     },
-     baseFare: { type: Number, default: 0 }, // ✅ New base fare field
+
+    // Delivery charge configuration
+    baseFare: { type: Number }, // Base fare for first 2km
+    baseDistanceKm: { type: Number }, // Base distance in km
+    additionalChargePerKm: { type: Number }, // Extra charge per km beyond base
+    deliveryCharge: { type: Number}, // Kept for backward compatibility
     profileImage: {
       type: String,
       default: "", // or a default image URL

@@ -19,7 +19,6 @@ import VendorWithdrawal from '../Models/VendorWithdrawal.js';
 
 
 
-
 export const registerAdmin = async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -109,13 +108,11 @@ export const updateOrderStatus = async (req, res) => {
   }
 
   try {
-    // 🧾 Find and validate order
     const order = await Order.findById(orderId);
     if (!order || order.userId.toString() !== userId) {
       return res.status(404).json({ message: 'Order not found for this user' });
     }
 
-    // 🛠️ Update current status & push status timeline
     order.status = status;
     order.statusTimeline.push({
       status,
@@ -125,17 +122,26 @@ export const updateOrderStatus = async (req, res) => {
 
     await order.save();
 
-    // 🛎️ Push new notification to user
-    const newNotification = {
-      orderId: order._id,
-      status,
-      message,
-      timestamp: new Date(),
-      read: false
-    };
+    // ✅ Admin notification — matches your schema exactly
+    const adminNotification = new Notification({
+      type: 'Order',               // ✅ valid enum value
+      referenceId: order._id,      // ✅ references the order
+      message: `Order ${status}: ${message}`,
+      status: 'Pending',
+    });
+    await adminNotification.save();
 
+    // ✅ Push to user's notifications array (for user app)
     await User.findByIdAndUpdate(userId, {
-      $push: { notifications: newNotification }
+      $push: {
+        notifications: {
+          orderId: order._id,
+          status,
+          message,
+          timestamp: new Date(),
+          read: false
+        }
+      }
     });
 
     return res.status(200).json({
@@ -149,7 +155,6 @@ export const updateOrderStatus = async (req, res) => {
     return res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
-
 
 
 // Get All Users
@@ -996,6 +1001,8 @@ export const getAllRiders = async (req, res) => {
           baseFare: rider.baseFare,
           accountDetails: rider.accountDetails || [],
           createdAt: rider.createdAt,
+          additionalChargePerKm:rider.additionalChargePerKm,
+          baseDistanceKm:rider.baseDistanceKm
         };
       })
     );
@@ -1292,15 +1299,40 @@ export const deletePrescriptionForAdmin = async (req, res) => {
 };
 
 
-// GET all notifications
 export const getAllNotifications = async (req, res) => {
   try {
+    // ✅ Fetch all — schema has no userId field so all are admin notifications
     const notifications = await Notification.find()
-      .sort({ createdAt: -1 });
-    return res.status(200).json(notifications);
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const formattedNotifications = notifications.map(notification => ({
+      _id: notification._id,
+      title: `Order Update`,
+      body: notification.message,
+      type: notification.type,
+      referenceId: notification.referenceId,
+      message: notification.message,
+      status: notification.status,
+      read: notification.status === 'Seen',
+      createdAt: notification.createdAt,
+      readAt: notification.readAt,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      message: "Notifications fetched successfully",
+      total: formattedNotifications.length,
+      notifications: formattedNotifications
+    });
+
   } catch (error) {
     console.error("Get Notifications Error:", error);
-    return res.status(500).json({ message: "Server error", error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message
+    });
   }
 };
 
@@ -1748,44 +1780,48 @@ export const deleteBanner = async (req, res) => {
 export const acceptWithdrawalRequest = async (req, res) => {
   try {
     const { requestId } = req.params;
-    const { status } = req.body; // <- 👈 Taking status from body
+    const { status } = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(requestId)) {
       return res.status(400).json({ message: "Invalid requestId" });
     }
 
+    // ✅ Find the withdrawal request
     const request = await withdrawalRequestModel.findById(requestId);
     if (!request) {
       return res.status(404).json({ message: "Withdrawal request not found" });
     }
 
+    // ✅ Try to find rider — but don't block if not found
     const rider = await Rider.findById(request.riderId);
-    if (!rider) {
-      return res.status(404).json({ message: "Rider not found" });
-    }
 
-    // If the new status is "Accepted", deduct wallet
+    // If status is Approved, wallet deduction only if rider exists
     if (status === "Approved") {
       if (request.status !== "Requested") {
         return res.status(400).json({ message: "Only 'Requested' withdrawals can be accepted" });
       }
 
-      if (request.amount > rider.wallet) {
-        return res.status(400).json({ message: "Insufficient wallet balance" });
+      if (rider) {
+        if (request.amount > rider.wallet) {
+          return res.status(400).json({ message: "Insufficient wallet balance" });
+        }
+        rider.wallet -= request.amount;
+        await rider.save();
       }
-
-      rider.wallet -= request.amount;
-      await rider.save();
     }
 
-    // Update withdrawal request status
+    // ✅ Update withdrawal request status
     request.status = status;
     request.updatedAt = new Date();
     await request.save();
 
+    // ✅ Fetch updated request fresh from DB to return full object
+    const updatedRequest = await withdrawalRequestModel.findById(requestId).lean();
+
     return res.status(200).json({
       message: `Withdrawal request ${status.toLowerCase()} successfully`,
-      remainingWallet: `₹${rider.wallet.toFixed(2)}`,
+      remainingWallet: rider ? `₹${rider.wallet.toFixed(2)}` : null,
+      request: updatedRequest,
     });
 
   } catch (error) {
@@ -1800,16 +1836,15 @@ export const getAllWithdrawalRequestsController = async (req, res) => {
     const requests = await withdrawalRequestModel
       .find()
       .sort({ createdAt: -1 })
-      .populate('riderId', 'name email phone profileImage city state'); // populate with specific fields
+      .populate('riderId', 'name email phone profileImage city state');
 
-    if (!requests || requests.length === 0) {
-      return res.status(404).json({ message: "No withdrawal requests found" });
-    }
-
+    // ✅ Return empty array instead of 404 so frontend always gets a response
     return res.status(200).json({
       message: "Withdrawal requests retrieved successfully",
-      requests,
+      total: requests.length,
+      requests: requests || [],
     });
+
   } catch (error) {
     console.error("Error fetching withdrawal requests:", error);
     return res.status(500).json({ message: "Server error while fetching withdrawal requests" });
@@ -2336,10 +2371,10 @@ export const deleteCoupon = async (req, res) => {
 
 
 
-// Set base fare for all riders
+// Set base fare configuration for all riders - POST
 export const setBaseFareForAllRiders = async (req, res) => {
   try {
-    const { baseFare } = req.body;
+    const { baseFare, baseDistanceKm, additionalChargePerKm } = req.body;
 
     if (!baseFare || baseFare < 0) {
       return res.status(400).json({
@@ -2348,17 +2383,43 @@ export const setBaseFareForAllRiders = async (req, res) => {
       });
     }
 
-    // Update base fare for all riders
+    if (!baseDistanceKm || baseDistanceKm < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid base distance in km is required"
+      });
+    }
+
+    if (!additionalChargePerKm || additionalChargePerKm < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid additional charge per km is required"
+      });
+    }
+
+    // Update all riders with new delivery charge configuration
     const result = await Rider.updateMany(
       {},
-      { $set: { baseFare: parseFloat(baseFare) } }
+      { 
+        $set: { 
+          baseFare: parseFloat(baseFare),
+          baseDistanceKm: parseFloat(baseDistanceKm),
+          additionalChargePerKm: parseFloat(additionalChargePerKm),
+          // Keep deliveryCharge for backward compatibility
+          deliveryCharge: parseFloat(baseFare)
+        } 
+      }
     );
 
     res.status(200).json({
       success: true,
-      message: `Base fare updated to ₹${baseFare} for all ${result.modifiedCount} riders`,
+      message: `Delivery charge configuration updated for all ${result.modifiedCount} riders`,
       modifiedCount: result.modifiedCount,
-      baseFare: baseFare
+      configuration: {
+        baseFare: parseFloat(baseFare),
+        baseDistanceKm: parseFloat(baseDistanceKm),
+        additionalChargePerKm: parseFloat(additionalChargePerKm)
+      }
     });
 
   } catch (error) {
@@ -2370,14 +2431,55 @@ export const setBaseFareForAllRiders = async (req, res) => {
   }
 };
 
-// Get current base fare (from first rider)
+// Get base fare configuration - GET
+export const getBaseFareConfiguration = async (req, res) => {
+  try {
+    // Get first rider to get the configuration
+    const rider = await Rider.findOne().select("baseFare baseDistanceKm additionalChargePerKm");
+    
+    if (!rider) {
+      // Return default configuration if no riders exist
+      return res.status(200).json({
+        success: true,
+        configuration: {
+          baseFare: 30,
+          baseDistanceKm: 2,
+          additionalChargePerKm: 10
+        },
+        message: "Default configuration (no riders found)"
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      configuration: {
+        baseFare: rider.baseFare || 30,
+        baseDistanceKm: rider.baseDistanceKm || 2,
+        additionalChargePerKm: rider.additionalChargePerKm || 10
+      }
+    });
+
+  } catch (error) {
+    console.error("Error getting base fare configuration:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error"
+    });
+  }
+};
+
+// Get current base fare configuration (from first rider)
 export const getCurrentBaseFare = async (req, res) => {
   try {
-    const rider = await Rider.findOne().select("baseFare");
+    const rider = await Rider.findOne().select("baseFare baseDistanceKm additionalChargePerKm");
     
     res.status(200).json({
       success: true,
-      baseFare: rider?.baseFare || 30 // Default to 30 if not set
+      configuration: {
+        baseFare: rider?.baseFare || 30,
+        baseDistanceKm: rider?.baseDistanceKm || 2,
+        additionalChargePerKm: rider?.additionalChargePerKm || 10
+      }
     });
 
   } catch (error) {
@@ -2389,22 +2491,43 @@ export const getCurrentBaseFare = async (req, res) => {
   }
 };
 
+
+
 // Update base fare for specific rider
 export const updateRiderBaseFare = async (req, res) => {
   try {
     const { riderId } = req.params;
-    const { baseFare } = req.body;
+    const { baseFare, baseDistanceKm, additionalChargePerKm } = req.body;
 
-    if (!baseFare || baseFare < 0) {
+    if (baseFare && baseFare < 0) {
       return res.status(400).json({
         success: false,
         message: "Valid base fare amount is required"
       });
     }
 
+    if (baseDistanceKm && baseDistanceKm < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid base distance in km is required"
+      });
+    }
+
+    if (additionalChargePerKm && additionalChargePerKm < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid additional charge per km is required"
+      });
+    }
+
+    const updateData = {};
+    if (baseFare !== undefined) updateData.baseFare = parseFloat(baseFare);
+    if (baseDistanceKm !== undefined) updateData.baseDistanceKm = parseFloat(baseDistanceKm);
+    if (additionalChargePerKm !== undefined) updateData.additionalChargePerKm = parseFloat(additionalChargePerKm);
+
     const rider = await Rider.findByIdAndUpdate(
       riderId,
-      { baseFare: parseFloat(baseFare) },
+      { $set: updateData },
       { new: true }
     );
 
@@ -2417,7 +2540,12 @@ export const updateRiderBaseFare = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `Base fare updated to ₹${baseFare} for rider ${rider.name}`,
+      message: `Delivery charge configuration updated for rider ${rider.name}`,
+      configuration: {
+        baseFare: rider.baseFare,
+        baseDistanceKm: rider.baseDistanceKm,
+        additionalChargePerKm: rider.additionalChargePerKm
+      },
       rider: rider
     });
 
@@ -2434,53 +2562,68 @@ export const updateRiderBaseFare = async (req, res) => {
 
 export const getAllPrescriptionOrders = async (req, res) => {
   try {
-    // Step 1: Find all orders where 'isPrescriptionOrder' is true
-    const orders = await Order.find({ isPrescriptionOrder: true })  // No filtering by vendorId
-      .populate("assignedRider")  // Populate assigned rider details
-      .populate("userId", "userId name email mobile") // Populate user details: name, email, and phone
-      .sort({ createdAt: -1 }); // Sort orders by newest first
-
-    // Step 2: If no orders found
-    if (orders.length === 0) {
-      return res.status(404).json({
-        message: "No prescription orders found",
-        orders: [],
+    // First, fetch all prescriptions with user details (similar to getAllPrescriptionsForAdmin)
+    const prescriptions = await Prescription.find()
+      .populate("userId", "name email mobile profileImage")
+      .sort({ createdAt: -1 });
+    
+    if (!prescriptions || prescriptions.length === 0) {
+      return res.status(200).json({
+        count: 0,
+        prescriptions: []
       });
     }
-
-    // Step 3: Send response with detailed order information
-    return res.status(200).json({
-      message: "Prescription orders fetched successfully",
-      orders: orders.map((order) => ({
-        ...order.toObject(),
-        assignedRider: order.assignedRider
-          ? {
-              _id: order.assignedRider._id,
-              name: order.assignedRider.name,
-              email: order.assignedRider.email,
-              phone: order.assignedRider.phone,
-              address: order.assignedRider.address,
-              city: order.assignedRider.city,
-              state: order.assignedRider.state,
-              pinCode: order.assignedRider.pinCode,
-              profileImage: order.assignedRider.profileImage,
-              rideImages: order.assignedRider.rideImages,
-              deliveryCharge: order.assignedRider.deliveryCharge,
-            }
-          : null,
-        user: order.userId
-          ? {
-              name: order.userId.name,
-              email: order.userId.email,
-              mobile: order.userId.mobile,
-              userId: order.userId.userId,
-            }
-          : null, // Add user info here
-      })),
+    
+    // Now, for each prescription, find if there's a linked order
+    const prescriptionOrders = await Promise.all(
+      prescriptions.map(async (prescription) => {
+        // Find order that contains this prescription
+        const order = await Order.findOne({
+          $or: [
+            { prescription: prescription._id },
+            { prescriptionId: prescription._id },
+            { "prescriptions": prescription._id }
+          ]
+        })
+        .populate("assignedRider", "name email phone")
+        .lean();
+        
+        // Format the prescription with order details
+        const prescriptionObj = prescription.toObject();
+        
+        return {
+          _id: prescriptionObj._id,
+          userId: prescriptionObj.userId,
+          images: prescriptionObj.images || [],
+          notes: prescriptionObj.notes || "",
+          status: prescriptionObj.status || "Pending",
+          createdAt: prescriptionObj.createdAt,
+          updatedAt: prescriptionObj.updatedAt,
+          // Add order details if exists
+          orderDetails: order ? {
+            orderId: order._id,
+            orderStatus: order.status,
+            totalAmount: order.totalAmount,
+            paymentMethod: order.paymentMethod,
+            assignedRider: order.assignedRider,
+            deliveryAddress: order.deliveryAddress,
+            createdAt: order.createdAt
+          } : null
+        };
+      })
+    );
+    
+    res.status(200).json({
+      count: prescriptionOrders.length,
+      prescriptions: prescriptionOrders
     });
+    
   } catch (error) {
-    console.error("Error fetching prescription orders:", error);
-    return res.status(500).json({ message: "Server error", error: error.message });
+    console.error("Get Prescription Orders Error:", error);
+    res.status(500).json({
+      message: "Error fetching prescription orders",
+      error: error.message
+    });
   }
 };
 

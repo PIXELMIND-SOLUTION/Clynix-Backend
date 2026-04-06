@@ -7,6 +7,7 @@ import mongoose from 'mongoose';
 import Prescription from '../Models/Prescription.js';
 import { Notification } from '../Models/Notification.js';
 import Order from '../Models/Order.js';
+import BankAccount from "../Models/BankAccount.js";
 
 dotenv.config();
 
@@ -440,29 +441,45 @@ export const getPharmacies = async (req, res) => {
       }
 
       // 🔍 Find the pharmacy
-      const pharmacy = await Pharmacy.findById(pharmacyId);
+      const pharmacy = await Pharmacy.findById(pharmacyId).lean();
+      
       if (!pharmacy) {
         return res.status(404).json({ message: 'Pharmacy not found' });
       }
 
       // 💊 Find medicines related to this pharmacy
-      const medicines = await Medicine.find({ pharmacyId });
+      const medicines = await Medicine.find({ pharmacyId }).lean();
+      
+      // Get bank accounts from BankAccount collection
+      const bankAccounts = await BankAccount.find({ vendor: pharmacyId }).lean();
 
       return res.status(200).json({
         message: 'Pharmacy fetched successfully',
-        pharmacy,
+        pharmacy: {
+          ...pharmacy,
+          bankDetails: bankAccounts // Use the separate BankAccount model data
+        },
         totalMedicines: medicines.length,
         medicines,
       });
     }
 
     // 📦 If no pharmacyId → fetch all pharmacies
-    const pharmacies = await Pharmacy.find();
+    const pharmacies = await Pharmacy.find().lean();
+    
+    // Get bank accounts for all pharmacies
+    const pharmaciesWithBankDetails = await Promise.all(pharmacies.map(async (pharmacy) => {
+      const bankAccounts = await BankAccount.find({ vendor: pharmacy._id }).lean();
+      return {
+        ...pharmacy,
+        bankDetails: bankAccounts
+      };
+    }));
 
     return res.status(200).json({
       message: 'Pharmacies fetched successfully',
-      total: pharmacies.length,
-      pharmacies,
+      total: pharmaciesWithBankDetails.length,
+      pharmacies: pharmaciesWithBankDetails,
     });
 
   } catch (error) {
