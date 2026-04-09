@@ -203,6 +203,11 @@ pickupProgress: [
     proofImageUrl: String
   }
 ],
+prescriptionId: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: 'Prescription',
+  default: null
+},
 
 
 

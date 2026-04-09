@@ -40,7 +40,9 @@ import {
      confirmDeleteAccount,
      deleteUser,
      deleteNotification,
-     bulkDeleteNotifications
+     bulkDeleteNotifications,
+     respondToPrescriptionQuote,
+     getPrescriptionQuoteDetails
     } from '../Controller/UserController.js'; // Import UserController
 const router = express.Router();
 
@@ -100,7 +102,8 @@ router.delete('/:userId/notifications/bulk', bulkDeleteNotifications);
 
 
 
-
+router.post('/users/:userId/prescription/:prescriptionId/respond', respondToPrescriptionQuote);
+router.get('/prescription/:userId/:prescriptionId/quote', getPrescriptionQuoteDetails);
 
 
 

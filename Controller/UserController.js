@@ -24,6 +24,7 @@ import nodemailer from 'nodemailer';
 import crypto from 'crypto';
 
 
+// other imports as needed
 
 
 
@@ -1781,28 +1782,28 @@ export const sendPrescription = async (req, res) => {
 
 
 
-// ✅ Get Prescriptions for a User using params
-export const getPrescriptionsForUser = async (req, res) => {
-  try {
-    const { userId } = req.params;
+// // ✅ Get Prescriptions for a User using params
+// export const getPrescriptionsForUser = async (req, res) => {
+//   try {
+//     const { userId } = req.params;
 
-    if (!userId) {
-      return res.status(400).json({ message: "userId is required in params" });
-    }
+//     if (!userId) {
+//       return res.status(400).json({ message: "userId is required in params" });
+//     }
 
-    const prescriptions = await Prescription.find({ userId })
-      .populate("pharmacyId", "name email phone") // populate pharmacy info
-      .sort({ createdAt: -1 });
+//     const prescriptions = await Prescription.find({ userId })
+//       .populate("pharmacyId", "name email phone") // populate pharmacy info
+//       .sort({ createdAt: -1 });
 
-    res.status(200).json({
-      message: "User prescriptions fetched successfully",
-      prescriptions,
-    });
-  } catch (error) {
-    console.error("Get User Prescriptions Error:", error);
-    res.status(500).json({ message: "Error fetching user prescriptions", error: error.message });
-  }
-};
+//     res.status(200).json({
+//       message: "User prescriptions fetched successfully",
+//       prescriptions,
+//     });
+//   } catch (error) {
+//     console.error("Get User Prescriptions Error:", error);
+//     res.status(500).json({ message: "Error fetching user prescriptions", error: error.message });
+//   }
+// };
 
 
 
@@ -3141,6 +3142,354 @@ export const bulkDeleteNotifications = async (req, res) => {
       message: "Server error",
       error: error.message,
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+
+
+// =============================================
+// USER PRESCRIPTION QUOTE RESPONSE - FIXED
+// =============================================
+
+// User responds to prescription quote (accept/reject)
+export const respondToPrescriptionQuote = async (req, res) => {
+  try {
+    const { userId, prescriptionId } = req.params;
+    const { accept } = req.body;
+
+    if (typeof accept !== 'boolean') {
+      return res.status(400).json({ 
+        success: false, 
+        message: "accept must be true or false" 
+      });
+    }
+
+    // Find prescription
+    const prescription = await Prescription.findOne({
+      _id: prescriptionId,
+      userId: userId,
+      status: "QuoteSent"
+    });
+    
+    if (!prescription) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Quote not found or already responded" 
+      });
+    }
+
+    const pharmacy = await Pharmacy.findById(prescription.pharmacyId);
+    const user = await User.findById(userId);
+
+    if (!pharmacy) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Pharmacy not found" 
+      });
+    }
+
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+
+    if (accept) {
+      // ACCEPT - Create order
+      prescription.status = "QuoteAccepted";
+      await prescription.save();
+
+      // Get user address
+      const userAddress = user.myAddresses && user.myAddresses[0];
+      if (!userAddress) {
+        return res.status(404).json({ 
+          success: false, 
+          message: "Please add an address first" 
+        });
+      }
+
+      const deliveryAddress = {
+        house: userAddress.house || "",
+        street: userAddress.street || "",
+        city: userAddress.city || "",
+        state: userAddress.state || "",
+        pincode: userAddress.pincode || "",
+        country: userAddress.country || "India"
+      };
+
+      // Create order items
+      const orderItems = [{
+        medicineId: null,
+        name: "Prescription Medicines",
+        quantity: 1,
+        price: prescription.proposedAmount,
+        images: [prescription.prescriptionUrl],
+        images: [prescription.prescriptionUrl],
+        description: prescription.proposedDescription,
+        pharmacy: pharmacy._id
+      }];
+
+      // Create order
+      const newOrder = new Order({
+        userId: userId,
+        vendorId: pharmacy._id,
+        pharmacyId: pharmacy._id,
+        deliveryAddress: deliveryAddress,
+        orderItems: orderItems,
+        subTotal: prescription.proposedAmount,
+        platformFee: prescription.platformFee || 10,
+        deliveryCharge: prescription.deliveryCharge || 40,
+        totalAmount: prescription.totalAmount || (prescription.proposedAmount + (prescription.deliveryCharge || 40) + (prescription.platformFee || 10)),
+        notes: prescription.notes || "",
+        voiceNoteUrl: "",
+        paymentMethod: "Cash on Delivery",
+        paymentStatus: "Pending",
+        status: "Pending",
+        isPrescriptionOrder: true,
+        prescriptionId: prescriptionId,
+        statusTimeline: [{
+          status: "Pending",
+          message: "Order placed from prescription",
+          timestamp: new Date()
+        }],
+        pharmacyResponse: "Pending",
+        pharmacyResponses: [{
+          pharmacyId: pharmacy._id,
+          status: "Pending",
+          respondedAt: null
+        }]
+      });
+
+      await newOrder.save();
+
+      // Update prescription with order reference
+      prescription.orderId = newOrder._id;
+      await prescription.save();
+
+      // Notify pharmacy
+      pharmacy.notifications = pharmacy.notifications || [];
+      pharmacy.notifications.unshift({
+        orderId: newOrder._id,
+        status: "Pending",
+        message: `🆕 New order from ${user.name} (Prescription)`,
+        timestamp: new Date(),
+        read: false
+      });
+      await pharmacy.save();
+
+      // Notify user
+      user.notifications = user.notifications || [];
+      user.notifications.unshift({
+        orderId: newOrder._id,
+        status: "Pending",
+        message: `✅ Order placed successfully! Order ID: ${newOrder._id.toString().slice(-6)}`,
+        timestamp: new Date(),
+        read: false
+      });
+      await user.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Quote accepted! Order created successfully",
+        status: prescription.status,
+        order: {
+          _id: newOrder._id,
+          totalAmount: newOrder.totalAmount,
+          status: newOrder.status,
+          orderId: newOrder._id.toString().slice(-6)
+        }
+      });
+
+    } else {
+      // REJECT
+      prescription.status = "QuoteRejected";
+      await prescription.save();
+
+      // Notify pharmacy
+      pharmacy.notifications = pharmacy.notifications || [];
+      pharmacy.notifications.unshift({
+        orderId: null,
+        status: "PrescriptionResponse",
+        message: `❌ User rejected your quote for prescription`,
+        timestamp: new Date(),
+        read: false
+      });
+      await pharmacy.save();
+
+      // Notify user
+      user.notifications = user.notifications || [];
+      user.notifications.unshift({
+        orderId: null,
+        status: "PrescriptionResponse",
+        message: `You rejected the quote from ${pharmacy.name}`,
+        timestamp: new Date(),
+        read: false
+      });
+      await user.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Quote rejected",
+        status: prescription.status
+      });
+    }
+
+  } catch (error) {
+    console.error("Respond to quote error:", error);
+    return res.status(500).json({ 
+      success: false, 
+      message: "Server error", 
+      error: error.message 
+    });
+  }
+};
+
+// Get prescriptions for user (with quote details)
+export const getPrescriptionsForUser = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "userId is required" 
+      });
+    }
+
+    const prescriptions = await Prescription.find({ userId })
+      .populate("pharmacyId", "name email phone vendorName image address")
+      .sort({ createdAt: -1 });
+
+    const formattedPrescriptions = prescriptions.map(p => ({
+      _id: p._id,
+      prescriptionId: p._id,
+      prescriptionUrl: p.prescriptionUrl,
+      notes: p.notes,
+      status: p.status,
+      pharmacy: p.pharmacyId ? {
+        _id: p.pharmacyId._id,
+        name: p.pharmacyId.name,
+        email: p.pharmacyId.email,
+        phone: p.pharmacyId.phone,
+        vendorName: p.pharmacyId.vendorName,
+        image: p.pharmacyId.image,
+        address: p.pharmacyId.address
+      } : null,
+      proposedAmount: p.proposedAmount,
+      proposedDescription: p.proposedDescription,
+      deliveryCharge: p.deliveryCharge,
+      platformFee: p.platformFee,
+      totalAmount: p.totalAmount,
+      orderId: p.orderId,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt
+    }));
+
+    res.status(200).json({
+      success: true,
+      message: "Prescriptions fetched successfully",
+      total: formattedPrescriptions.length,
+      prescriptions: formattedPrescriptions
+    });
+
+  } catch (error) {
+    console.error("Get User Prescriptions Error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching prescriptions", 
+      error: error.message 
+    });
+  }
+};
+
+
+// Get single prescription with quote details for user
+export const getPrescriptionQuoteDetails = async (req, res) => {
+  try {
+    const { userId, prescriptionId } = req.params;
+
+    // Validate IDs
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid user ID" 
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(prescriptionId)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid prescription ID" 
+      });
+    }
+
+    // Find prescription belonging to this user
+    const prescription = await Prescription.findOne({
+      _id: prescriptionId,
+      userId: userId
+    }).populate("pharmacyId", "name email phone vendorName image address location");
+
+    if (!prescription) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Prescription not found" 
+      });
+    }
+
+    // Check if quote has been sent
+    if (prescription.status !== "QuoteSent" && prescription.status !== "QuoteAccepted" && prescription.status !== "QuoteRejected") {
+      return res.status(400).json({ 
+        success: false, 
+        message: `No quote available. Current status: ${prescription.status}` 
+      });
+    }
+
+    // Format response with all quote details
+    return res.status(200).json({
+      success: true,
+      message: "Quote details fetched successfully",
+      quote: {
+        prescriptionId: prescription._id,
+        prescriptionUrl: prescription.prescriptionUrl,
+        notes: prescription.notes,
+        status: prescription.status,
+        
+        // Quote details from vendor
+        proposedAmount: prescription.proposedAmount,
+        proposedDescription: prescription.proposedDescription,
+        deliveryCharge: prescription.deliveryCharge,
+        platformFee: prescription.platformFee,
+        totalAmount: prescription.totalAmount,
+        
+        // Pharmacy details
+        pharmacy: {
+          id: prescription.pharmacyId?._id,
+          name: prescription.pharmacyId?.name,
+          email: prescription.pharmacyId?.email,
+          phone: prescription.pharmacyId?.phone,
+          vendorName: prescription.pharmacyId?.vendorName,
+          image: prescription.pharmacyId?.image,
+          address: prescription.pharmacyId?.address,
+          location: prescription.pharmacyId?.location
+        },
+        
+        // Order reference if accepted
+        orderId: prescription.orderId,
+        
+        // Timestamps
+        quoteSentAt: prescription.updatedAt,
+        createdAt: prescription.createdAt
+      }
+    });
+
+  } catch (error) {
+    console.error("Error fetching prescription quote details:", error);
+    return res.status(500).json({ 
+      success: false, 
+      message: "Server error", 
+      error: error.message 
     });
   }
 };
