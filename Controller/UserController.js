@@ -3406,6 +3406,7 @@ export const getPrescriptionsForUser = async (req, res) => {
 
 
 // Get single prescription with quote details for user
+// Get single prescription with quote details for user
 export const getPrescriptionQuoteDetails = async (req, res) => {
   try {
     const { userId, prescriptionId } = req.params;
@@ -3446,6 +3447,15 @@ export const getPrescriptionQuoteDetails = async (req, res) => {
       });
     }
 
+    // Validate that all required quote fields exist
+    if (!prescription.proposedAmount || !prescription.deliveryCharge || !prescription.totalAmount) {
+      console.warn(`Prescription ${prescriptionId} has incomplete quote data:`, {
+        proposedAmount: prescription.proposedAmount,
+        deliveryCharge: prescription.deliveryCharge,
+        totalAmount: prescription.totalAmount
+      });
+    }
+
     // Format response with all quote details
     return res.status(200).json({
       success: true,
@@ -3457,26 +3467,26 @@ export const getPrescriptionQuoteDetails = async (req, res) => {
         status: prescription.status,
         
         // Quote details from vendor
-        proposedAmount: prescription.proposedAmount,
-        proposedDescription: prescription.proposedDescription,
-        deliveryCharge: prescription.deliveryCharge,
-        platformFee: prescription.platformFee,
-        totalAmount: prescription.totalAmount,
+        proposedAmount: prescription.proposedAmount || 0,
+        proposedDescription: prescription.proposedDescription || "",
+        deliveryCharge: prescription.deliveryCharge || 0,
+        platformFee: prescription.platformFee || 10,
+        totalAmount: prescription.totalAmount || 0,
         
         // Pharmacy details
-        pharmacy: {
-          id: prescription.pharmacyId?._id,
-          name: prescription.pharmacyId?.name,
-          email: prescription.pharmacyId?.email,
-          phone: prescription.pharmacyId?.phone,
-          vendorName: prescription.pharmacyId?.vendorName,
-          image: prescription.pharmacyId?.image,
-          address: prescription.pharmacyId?.address,
-          location: prescription.pharmacyId?.location
-        },
+        pharmacy: prescription.pharmacyId ? {
+          id: prescription.pharmacyId._id,
+          name: prescription.pharmacyId.name,
+          email: prescription.pharmacyId.email,
+          phone: prescription.pharmacyId.phone,
+          vendorName: prescription.pharmacyId.vendorName,
+          image: prescription.pharmacyId.image,
+          address: prescription.pharmacyId.address,
+          location: prescription.pharmacyId.location
+        } : null,
         
         // Order reference if accepted
-        orderId: prescription.orderId,
+        orderId: prescription.orderId || null,
         
         // Timestamps
         quoteSentAt: prescription.updatedAt,

@@ -597,7 +597,7 @@ export const updateOrderStatusByVendor = async (req, res) => {
     if (!order.pharmacyResponses) order.pharmacyResponses = [];
 
     // =============================
-    // FIX: Handle periodic & prescription orders that use assignedPharmacy
+    // Handle periodic & prescription orders that use assignedPharmacy
     // instead of pharmacyResponses array
     // =============================
     const isPeriodicOrder = order.planType && ["Weekly", "Monthly"].includes(order.planType);
@@ -615,7 +615,6 @@ export const updateOrderStatusByVendor = async (req, res) => {
         order.pharmacyId?.toString() === vendorId;
 
       if (isAssignedPharmacy || isPeriodicOrder || isPrescriptionOrder) {
-        // Add a pharmacyResponse entry for this vendor so the rest of the logic works
         order.pharmacyResponses.push({
           pharmacyId: vendorId,
           status: "Pending",
@@ -675,33 +674,78 @@ export const updateOrderStatusByVendor = async (req, res) => {
           timestamp: new Date(),
         });
 
-        // Assign nearest rider
+        // =============================
+        // ASSIGN NEAREST RIDER
+        // Always uses latest admin-configured pricing from Rider model
+        // so if admin changes prices, next assignment picks them up automatically
+        // =============================
         if (!order.assignedRider) {
-          const riders = await Rider.find({ status: "online", drivingLicenseStatus: "Approved" });
+          const riders = await Rider.find({
+            status: "online",
+            drivingLicenseStatus: "Approved",
+          });
+
           let nearestRider = null;
           let minDistance = Infinity;
 
-          // FIX: Handle case where userId may not have location (periodic/prescription)
+          // Step 1: Try userId location from populated order
           let userLat = order.userId?.location?.coordinates?.[1];
           let userLng = order.userId?.location?.coordinates?.[0];
 
-          // Fallback: try to get user location directly if not populated
-          if (!userLat || !userLng) {
-            const userDoc = await mongoose.model ? 
-              null : null; // will use riders[0] location as fallback below
+          // Step 2: For prescription/periodic orders userId may not be populated with location
+          // Fetch user document directly
+          if ((!userLat || !userLng) && order.userId) {
+            try {
+              const userDoc = await User.findById(
+                order.userId._id || order.userId
+              )
+                .select("location")
+                .lean();
+
+              if (userDoc?.location?.coordinates?.length === 2) {
+                userLng = userDoc.location.coordinates[0];
+                userLat = userDoc.location.coordinates[1];
+              }
+            } catch (_) {
+              // continue to next fallback
+            }
           }
 
+          // Step 3: If still no user location, use assigned pharmacy location as reference
+          if ((!userLat || !userLng) && (order.pharmacyId || order.vendorId)) {
+            try {
+              const pharmacyDoc = await Pharmacy.findById(
+                order.pharmacyId || order.vendorId
+              )
+                .select("location latitude longitude")
+                .lean();
+
+              if (pharmacyDoc?.location?.coordinates?.length === 2) {
+                userLng = pharmacyDoc.location.coordinates[0];
+                userLat = pharmacyDoc.location.coordinates[1];
+              } else if (pharmacyDoc?.latitude && pharmacyDoc?.longitude) {
+                userLat = parseFloat(pharmacyDoc.latitude);
+                userLng = parseFloat(pharmacyDoc.longitude);
+              }
+            } catch (_) {
+              // continue to rider fallback
+            }
+          }
+
+          // Find nearest rider using best available reference location
           for (const rider of riders) {
             if (!rider.latitude || !rider.longitude) continue;
 
-            // Use pharmacy location as reference if user location unavailable
+            // Final fallback: if still no reference point, each rider is its own reference
+            // (effectively picks first online rider)
             const refLat = userLat || parseFloat(rider.latitude);
             const refLng = userLng || parseFloat(rider.longitude);
 
             const distance = calculateDistance(
-              [rider.longitude, rider.latitude],
+              [parseFloat(rider.longitude), parseFloat(rider.latitude)],
               [refLng, refLat]
             );
+
             if (distance < minDistance) {
               minDistance = distance;
               nearestRider = rider;
@@ -712,8 +756,29 @@ export const updateOrderStatusByVendor = async (req, res) => {
             order.assignedRider = nearestRider._id;
             order.assignedRiderStatus = "Assigned";
 
-            const baseFare = nearestRider.baseFare || 30;
-            order.deliveryCharge = calculateDeliveryCharge(minDistance) + baseFare;
+            // Use latest admin-configured pricing from this rider
+            // (admin uses setBaseFareForAllRiders which updates ALL riders,
+            //  so nearestRider always has the current admin-set values)
+            const baseFare = nearestRider.baseFare ?? 30;
+            const baseDistanceKm = nearestRider.baseDistanceKm ?? 2;
+            const additionalChargePerKm = nearestRider.additionalChargePerKm ?? 10;
+
+            let riderDeliveryCharge = baseFare;
+            if (minDistance > baseDistanceKm) {
+              riderDeliveryCharge =
+                baseFare +
+                (minDistance - baseDistanceKm) * additionalChargePerKm;
+            }
+            riderDeliveryCharge = Math.round(riderDeliveryCharge);
+
+            // For prescription orders: preserve the quoted deliveryCharge
+            // (user already accepted that amount — don't change it)
+            // For regular/periodic orders: set the calculated charge
+            if (!isPrescriptionOrder) {
+              order.deliveryCharge = riderDeliveryCharge;
+            }
+            // Note: isPrescriptionOrder keeps the deliveryCharge from sendPrescriptionQuote
+            // which was already calculated using admin config at quote time
 
             order.statusTimeline.push({
               status: "Rider Assigned",
@@ -722,7 +787,7 @@ export const updateOrderStatusByVendor = async (req, res) => {
             });
 
             nearestRider.notifications.push({
-              message: "New order assigned to you",
+              message: `New order assigned to you`,
               orderId: order._id,
               timestamp: new Date(),
             });
@@ -3002,38 +3067,35 @@ export const getPrescriptionsForVendor = async (req, res) => {
 };
 
 // Vendor sends quote for prescription
+
 export const sendPrescriptionQuote = async (req, res) => {
   try {
     const { vendorId, prescriptionId } = req.params;
     const { amount, description } = req.body;
-
+ 
     if (!amount || amount <= 0) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Valid amount is required" 
+      return res.status(400).json({
+        success: false,
+        message: "Valid amount is required"
       });
     }
-    
+ 
     if (!description) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Description is required" 
+      return res.status(400).json({
+        success: false,
+        message: "Description is required"
       });
     }
-
+ 
     // Find vendor
     let vendor = await Pharmacy.findById(vendorId);
     if (!vendor) {
       vendor = await Pharmacy.findOne({ vendorId: vendorId });
     }
-    
     if (!vendor) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Vendor not found" 
-      });
+      return res.status(404).json({ success: false, message: "Vendor not found" });
     }
-
+ 
     // Find prescription
     const prescription = await Prescription.findOne({
       _id: prescriptionId,
@@ -3042,87 +3104,98 @@ export const sendPrescriptionQuote = async (req, res) => {
     });
     
     if (!prescription) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Pending prescription not found for this vendor" 
+      return res.status(404).json({
+        success: false,
+        message: "Pending prescription not found for this vendor"
       });
     }
-
-    // Get user
+ 
+    // Find user
     const user = await User.findById(prescription.userId);
     if (!user) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "User not found" 
-      });
+      return res.status(404).json({ success: false, message: "User not found" });
     }
-
+ 
     // Calculate delivery charge
-    let deliveryCharge = 40;
-    let platformFee = 10;
-    
+    const riderConfig = await Rider.findOne({ drivingLicenseStatus: "Approved" })
+      .select("baseFare baseDistanceKm additionalChargePerKm")
+      .sort({ updatedAt: -1 })
+      .lean();
+ 
+    const baseFare = typeof riderConfig?.baseFare === "number" ? riderConfig.baseFare : 30;
+    const baseDistanceKm = typeof riderConfig?.baseDistanceKm === "number" ? riderConfig.baseDistanceKm : 2;
+    const additionalChargePerKm = typeof riderConfig?.additionalChargePerKm === "number" ? riderConfig.additionalChargePerKm : 10;
+ 
+    let deliveryCharge = baseFare;
+ 
     try {
-      const userHasLocation = user.location && 
-                              user.location.coordinates && 
-                              user.location.coordinates.length === 2;
-      const vendorHasLocation = vendor.location && 
-                                vendor.location.coordinates && 
-                                vendor.location.coordinates.length === 2;
-
+      const userCoords = user.location?.coordinates;
+      const vendorCoords = vendor.location?.coordinates;
+ 
+      const userHasLocation = Array.isArray(userCoords) && userCoords.length === 2;
+      const vendorHasLocation = Array.isArray(vendorCoords) && vendorCoords.length === 2;
+ 
       if (userHasLocation && vendorHasLocation) {
-        const [userLng, userLat] = user.location.coordinates;
-        const [vendorLng, vendorLat] = vendor.location.coordinates;
-
-        const toRad = (value) => (value * Math.PI) / 180;
+        const [userLng, userLat] = userCoords;
+        const [vendorLng, vendorLat] = vendorCoords;
+ 
+        const toRad = (v) => (v * Math.PI) / 180;
         const R = 6371;
         const dLat = toRad(vendorLat - userLat);
         const dLon = toRad(vendorLng - userLng);
         const a = Math.sin(dLat / 2) ** 2 +
                   Math.cos(toRad(userLat)) * Math.cos(toRad(vendorLat)) *
                   Math.sin(dLon / 2) ** 2;
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = R * c;
-
-        const rider = await Rider.findOne({ status: "online" });
-        const baseFare = rider?.baseFare || 30;
-        const baseDistanceKm = rider?.baseDistanceKm || 2;
-        const additionalChargePerKm = rider?.additionalChargePerKm || 10;
-
-        if (distance > baseDistanceKm) {
-          deliveryCharge = baseFare + ((distance - baseDistanceKm) * additionalChargePerKm);
-        } else {
-          deliveryCharge = baseFare;
+        const distance = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+ 
+        const MAX_VALID_DISTANCE_KM = 100;
+ 
+        if (distance > 0 && distance <= MAX_VALID_DISTANCE_KM) {
+          if (distance > baseDistanceKm) {
+            deliveryCharge = baseFare + (distance - baseDistanceKm) * additionalChargePerKm;
+          }
+          deliveryCharge = Math.round(deliveryCharge);
         }
-        deliveryCharge = Math.round(deliveryCharge);
       }
-    } catch (err) {
-      console.error("Delivery charge calculation error:", err);
+    } catch (distErr) {
+      console.error("Delivery charge calculation error:", distErr);
+      deliveryCharge = baseFare;
     }
-
+ 
+    const platformFee = 10;
     const totalAmount = amount + deliveryCharge + platformFee;
-
-    // Update prescription
+ 
+    // ⚠️ CRITICAL: Save these values BEFORE any other operations
     prescription.proposedAmount = amount;
     prescription.proposedDescription = description;
     prescription.deliveryCharge = deliveryCharge;
     prescription.platformFee = platformFee;
     prescription.totalAmount = totalAmount;
     prescription.status = "QuoteSent";
+    
+    // Save immediately
     await prescription.save();
-
-    // Notify user
-    if (user) {
-      user.notifications = user.notifications || [];
-      user.notifications.unshift({
-        orderId: null,
-        status: "PrescriptionQuote",
-        message: `📋 New Quote: ₹${amount} + ₹${deliveryCharge} delivery = ₹${totalAmount}\n\n${description}`,
-        timestamp: new Date(),
-        read: false
-      });
-      await user.save();
-    }
-
+    
+    // ✅ VERIFY the save was successful
+    const savedPrescription = await Prescription.findById(prescriptionId);
+    console.log("VERIFICATION - Saved values:", {
+      proposedAmount: savedPrescription.proposedAmount,
+      deliveryCharge: savedPrescription.deliveryCharge,
+      totalAmount: savedPrescription.totalAmount,
+      status: savedPrescription.status
+    });
+ 
+    // Now send notifications
+    user.notifications = user.notifications || [];
+    user.notifications.unshift({
+      orderId: null,
+      status: "PrescriptionQuote",
+      message: `New Quote: ₹${amount} medicines + ₹${deliveryCharge} delivery + ₹${platformFee} platform fee = ₹${totalAmount}\n\n${description}`,
+      timestamp: new Date(),
+      read: false
+    });
+    await user.save();
+ 
     return res.status(200).json({
       success: true,
       message: "Quote sent to user successfully",
@@ -3134,15 +3207,20 @@ export const sendPrescriptionQuote = async (req, res) => {
         platformFee: prescription.platformFee,
         totalAmount: prescription.totalAmount,
         status: prescription.status
+      },
+      adminDeliveryConfig: {
+        baseFare,
+        baseDistanceKm,
+        additionalChargePerKm
       }
     });
-
+ 
   } catch (error) {
-    console.error("Send prescription quote error:", error);
-    return res.status(500).json({ 
-      success: false, 
-      message: "Server error", 
-      error: error.message 
+    console.error("sendPrescriptionQuote error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message
     });
   }
 };
