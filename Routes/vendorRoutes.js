@@ -1,7 +1,5 @@
 import express from 'express';
-import { addBankAccount, addBankDetails, addPharmacyByVendorId, createMedicine, createOrderFromPrescription, createVendorQuery, deleteBankAccount, deleteMedicineByVendor, deleteNotificationForVendor, deleteOrder, editBankDetails, editMedicineByVendor, getAllMedicinesByVendor, getAllNotificationsForVendor, getAllOrdersByVendor, getAllPeriodicOrdersByVendor, getBankAccounts, getCategoriesByVendorId, getDeliveredOrdersByVendor, getMessagesForVendor, getPendingOrdersByVendor, getPrescriptionOrdersByVendor, getPrescriptionsForVendor, getVendorDashboard, getVendorProfile, getVendorQueries, getVendorWallet, getWithdrawalRequests, requestWithdrawal, updateBankAccount, updateOrderStatusByVendor, updatePrescriptionStatus, updateVendorProfile, updateVendorStatus, vendorLogin, vendorLogout,
-    sendPrescriptionQuote,getPendingPrescriptionsForVendor
- } from '../Controller/VendorController.js';
+import { addBankAccount, addBankDetails, addPharmacyByVendorId, createMedicine, createOrderFromPrescription, createVendorQuery, deleteBankAccount, deleteMedicineByVendor, deleteNotificationForVendor, deleteOrder, editBankDetails, editMedicineByVendor, getAllMedicinesByVendor, getAllNotificationsForVendor, getAllOrdersByVendor, getAllPeriodicOrdersByVendor, getBankAccounts, getCategoriesByVendorId, getDeliveredOrdersByVendor, getMessagesForVendor, getPendingOrdersByVendor, getPrescriptionOrdersByVendor, getPrescriptionsForVendor, getVendorDashboard, getVendorProfile, getVendorQueries, getVendorWallet, getWithdrawalRequests, requestWithdrawal, updateBankAccount, updateOrderStatusByVendor, updatePrescriptionStatus, updateVendorProfile, updateVendorStatus, vendorLogin, vendorLogout } from '../Controller/VendorController.js'
 import { getAllPreodicOrders } from '../Controller/AdminControler.js';
 
 const router = express.Router();
@@ -48,8 +46,7 @@ router.delete('/accounts/:vendorId/:accountId', deleteBankAccount);
 // Withdrawal routes
 router.post('/withdraw/:vendorId', requestWithdrawal);
 router.get('/withdrawals/:vendorId', getWithdrawalRequests);
-router.post('/:vendorId/prescription/:prescriptionId/send-quote', sendPrescriptionQuote);
-router.get('/:vendorId/prescriptions/pending', getPendingPrescriptionsForVendor);
+
 
 
 

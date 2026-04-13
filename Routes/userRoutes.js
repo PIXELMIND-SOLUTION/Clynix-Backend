@@ -41,8 +41,8 @@ import {
      deleteUser,
      deleteNotification,
      bulkDeleteNotifications,
-     respondToPrescriptionQuote,
-     getPrescriptionQuoteDetails
+     confirmPrescriptionOrder,  
+     getPendingPrescriptionPreviews
     } from '../Controller/UserController.js'; // Import UserController
 const router = express.Router();
 
@@ -100,10 +100,9 @@ router.delete('/delete-user/:userId', deleteUser);
 router.delete('/:userId/notifications/:notificationId', deleteNotification);
 router.delete('/:userId/notifications/bulk', bulkDeleteNotifications);
 
+router.get('/prescription-previews/:userId', getPendingPrescriptionPreviews);
+router.post('/confirmPrescriptionOrder/:userId', confirmPrescriptionOrder);
 
-
-router.post('/users/:userId/prescription/:prescriptionId/respond', respondToPrescriptionQuote);
-router.get('/prescription/:userId/:prescriptionId/quote', getPrescriptionQuoteDetails);
 
 
 

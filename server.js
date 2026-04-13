@@ -18,9 +18,7 @@ import adminRoutes from './Routes/adminRoutes.js';
 import vendorRoutes from './Routes/vendorRoutes.js';
 import riderRoutes from './Routes/riderRoutes.js';
 import Chat from './Models/Chat.js';
-import dns from "dns";
 
-dns.setServers(["8.8.8.8", "1.1.1.1"]);
 dotenv.config();
 
 const app = express();
