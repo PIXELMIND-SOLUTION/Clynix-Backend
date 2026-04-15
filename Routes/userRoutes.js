@@ -101,7 +101,7 @@ router.delete('/:userId/notifications/:notificationId', deleteNotification);
 router.delete('/:userId/notifications/bulk', bulkDeleteNotifications);
 
 router.get('/prescription-previews/:userId', getPendingPrescriptionPreviews);
-router.post('/confirmPrescriptionOrder/:userId', confirmPrescriptionOrder);
+router.post('/confirm-prescription-order/:userId/:prescriptionId', confirmPrescriptionOrder);
 
 
 

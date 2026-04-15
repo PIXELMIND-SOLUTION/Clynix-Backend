@@ -1812,163 +1812,99 @@ export const getDeliveredOrdersByVendor = async (req, res) => {
 
 
 
+// Replace your existing createOrderFromPrescription function with this
+
 export const createOrderFromPrescription = async (req, res) => {
   try {
     const { prescriptionId, vendorId, userId } = req.params;
     const { medicineDetails, notes, paymentMethod, paymentStatus } = req.body;
 
-    // Validate IDs
-    if (!mongoose.Types.ObjectId.isValid(prescriptionId) ||
-        !mongoose.Types.ObjectId.isValid(vendorId) ||
-        !mongoose.Types.ObjectId.isValid(userId)) {
+    // ── validate IDs ──────────────────────────────────────────────────────────
+    if (
+      !mongoose.Types.ObjectId.isValid(prescriptionId) ||
+      !mongoose.Types.ObjectId.isValid(vendorId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
       return res.status(400).json({ message: "Invalid IDs" });
     }
 
-    // Validate medicine details
-    if (!medicineDetails || !Array.isArray(medicineDetails) || medicineDetails.length === 0) {
-      return res.status(400).json({
-        message: "medicineDetails is required and must be an array",
-      });
+    if (!Array.isArray(medicineDetails) || medicineDetails.length === 0) {
+      return res.status(400).json({ message: "medicineDetails must be a non-empty array" });
     }
 
-    // Find prescription
+    // ── fetch documents ───────────────────────────────────────────────────────
     const prescription = await Prescription.findById(prescriptionId);
-    if (!prescription) {
-      return res.status(404).json({ message: "Prescription not found" });
-    }
+    if (!prescription) return res.status(404).json({ message: "Prescription not found" });
 
-    // Find user
     const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    // Find pharmacy/vendor
     const pharmacy = await Pharmacy.findById(vendorId);
-    if (!pharmacy) {
-      return res.status(404).json({ message: "Pharmacy not found" });
-    }
+    if (!pharmacy) return res.status(404).json({ message: "Pharmacy not found" });
 
-    // Get user address (first address from user's addresses)
-    const userAddress = user.myAddresses && user.myAddresses[0];
-    if (!userAddress) {
-      return res.status(404).json({ message: "User's address not found" });
+    // ── delivery address ──────────────────────────────────────────────────────
+    if (!user.myAddresses || user.myAddresses.length === 0) {
+      return res.status(404).json({ message: "User has no saved addresses" });
     }
-
+    const addr = user.myAddresses[0];
     const deliveryAddress = {
-      house: userAddress.house || "",
-      street: userAddress.street || "",
-      city: userAddress.city || "",
-      state: userAddress.state || "",
-      pincode: userAddress.pincode || "",
-      country: userAddress.country || "India",
+      house:   addr.house   || "",
+      street:  addr.street  || "",
+      city:    addr.city    || "",
+      state:   addr.state   || "",
+      pincode: addr.pincode || "",
+      country: addr.country || "India",
     };
 
-    // Process medicine details - ONLY use what's provided, no extra fields
+    // ── build order items & subtotal ──────────────────────────────────────────
     let subTotal = 0;
-    const processedOrderItems = [];
+    const orderItems = medicineDetails.map(item => {
+      const price    = Number(item.price) || 0;
+      const quantity = Number(item.quantity) || 1;
+      subTotal += price * quantity;
+      const entry = { medicineId: item.medicineId, name: item.name, quantity, price };
+      if (item.dosage)        entry.dosage        = item.dosage;
+      if (item.instructions)  entry.instructions  = item.instructions;
+      return entry;
+    });
 
-    for (const item of medicineDetails) {
-      // Use price directly from payload
-      const medicinePrice = item.price || 0;
-      const quantity = item.quantity || 1;
-      const totalPrice = medicinePrice * quantity;
-      subTotal += totalPrice;
+    const platformFee    = 10;
+    const deliveryCharge = 40;
+    const totalAmount    = subTotal + platformFee + deliveryCharge;
 
-      // Create item with ONLY the fields sent in payload
-      const orderItem = {
-        medicineId: item.medicineId,
-        name: item.name,
-        quantity: quantity,
-        price: medicinePrice,
-      };
-      
-      // Only add optional fields if they exist in payload
-      if (item.dosage) orderItem.dosage = item.dosage;
-      if (item.instructions) orderItem.instructions = item.instructions;
-      
-      // DO NOT add mrp or any other extra fields
-      processedOrderItems.push(orderItem);
-    }
-
-    // Calculate delivery charge based on distance
-    let deliveryCharge = 40;
-    try {
-      const userHasLocation = user.location && 
-                             user.location.coordinates && 
-                             Array.isArray(user.location.coordinates) && 
-                             user.location.coordinates.length === 2;
-      
-      const pharmacyHasLocation = pharmacy.location && 
-                                  pharmacy.location.coordinates && 
-                                  Array.isArray(pharmacy.location.coordinates) && 
-                                  pharmacy.location.coordinates.length === 2;
-
-      if (userHasLocation && pharmacyHasLocation) {
-        const [userLng, userLat] = user.location.coordinates;
-        const [pharmacyLng, pharmacyLat] = pharmacy.location.coordinates;
-        
-        const toRad = (v) => (v * Math.PI) / 180;
-        const R = 6371;
-        const dLat = toRad(pharmacyLat - userLat);
-        const dLon = toRad(pharmacyLng - userLng);
-        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                  Math.cos(toRad(userLat)) * Math.cos(toRad(pharmacyLat)) *
-                  Math.sin(dLon / 2) * Math.sin(dLon / 2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = R * c;
-        
-        const rider = await Rider.findOne({ status: "online", drivingLicenseStatus: "Approved" });
-        const baseFare = rider?.baseFare || 30;
-        const baseDistanceKm = rider?.baseDistanceKm || 2;
-        const additionalChargePerKm = rider?.additionalChargePerKm || 10;
-        
-        if (distance > baseDistanceKm) {
-          deliveryCharge = baseFare + (distance - baseDistanceKm) * additionalChargePerKm;
-        } else {
-          deliveryCharge = baseFare;
-        }
-        deliveryCharge = Math.round(deliveryCharge);
-      }
-    } catch (distanceError) {
-      console.error("Error calculating distance:", distanceError);
-      deliveryCharge = 40;
-    }
-
-    const platformFee = 10;
-    const totalAmount = subTotal + platformFee + deliveryCharge;
-
-    // Build order preview with ONLY necessary fields
+    // ── build preview object ──────────────────────────────────────────────────
     const orderPreview = {
       prescriptionId,
       vendorId,
       userId,
-      pharmacyName: pharmacy.name,
-      pharmacyImage: pharmacy.image || null,
+      pharmacyName:    pharmacy.name,
+      pharmacyImage:   pharmacy.image  || null,
+      pharmacyAddress: pharmacy.address,
+      pharmacyPhone:   pharmacy.vendorPhone,
       deliveryAddress,
-      orderItems: processedOrderItems,  // Now contains only fields from payload
+      orderItems,
       subTotal,
       platformFee,
       deliveryCharge,
       totalAmount,
-      notes: notes || "",
-      paymentMethod: paymentMethod || "Cash on Delivery",
-      paymentStatus: paymentStatus || "Pending",
-      status: "Preview",
-      isPrescriptionOrder: true,
+      notes:           notes          || "",
+      paymentMethod:   paymentMethod  || "Cash on Delivery",
+      paymentStatus:   paymentStatus  || "Pending",
       prescriptionUrl: prescription.prescriptionUrl,
-      createdAt: new Date(),
     };
 
-    // Remove undefined fields
-    Object.keys(orderPreview).forEach(key => 
-      orderPreview[key] === undefined && delete orderPreview[key]
+    // ── push notification to user ─────────────────────────────────────────────
+    if (!user.notifications) user.notifications = [];
+
+    // Remove any previous un-acted preview for this same prescription
+    user.notifications = user.notifications.filter(
+      n => !(n.type === "prescription_order_preview" &&
+             n.prescriptionId?.toString() === prescriptionId)
     );
 
-    // Store preview in user's notifications
-    user.notifications = user.notifications || [];
+    // Add the new notification with ALL required fields
     user.notifications.push({
-      type: "prescription_order_preview",
+      type: "prescription_order_preview",  // ✅ IMPORTANT: This must be set
       status: "Pending",
       message: `${pharmacy.name} has reviewed your prescription and prepared an order. Please review and confirm.`,
       timestamp: new Date(),
@@ -1976,73 +1912,62 @@ export const createOrderFromPrescription = async (req, res) => {
       orderPreview: orderPreview,
       prescriptionId: prescriptionId,
       vendorId: vendorId,
+      orderId: null  // Explicitly set to null for preview
     });
-    
+
     await user.save();
 
-    prescription.status = "Pending Vendor Response";
+    // ── update prescription status ────────────────────────────────────────────
+    prescription.status = "Pending User Confirmation";
     await prescription.save();
 
-    pharmacy.notifications = pharmacy.notifications || [];
-    pharmacy.notifications.push({
-      type: "prescription_order_preview_sent",
-      status: "Sent",
-      message: `Order preview sent to user for prescription ${prescriptionId}`,
-      timestamp: new Date(),
-      read: false,
-      userId: userId,
-      prescriptionId: prescriptionId,
-    });
-    await pharmacy.save();
+    console.log("✅ Order preview sent to user. Notification saved:", JSON.stringify(user.notifications[user.notifications.length - 1], null, 2));
 
     return res.status(200).json({
       message: "Order preview sent to user for confirmation",
       orderPreview,
     });
-    
+
   } catch (error) {
-    console.error("Error creating order preview from prescription:", error);
-    return res.status(500).json({
-      message: "Server Error",
-      error: error.message,
-    });
+    console.error("createOrderFromPrescription error:", error);
+    return res.status(500).json({ message: "Server Error", error: error.message });
   }
 };
- 
-
-
 
 // Update Prescription Status
 export const updatePrescriptionStatus = async (req, res) => {
   try {
-    const { prescriptionId } = req.params;
+    const { prescriptionId } = req.params;   // ← correct param name
     const { status } = req.body;
-
-    // Validate input
+ 
     if (!status) {
       return res.status(400).json({ message: "Status is required." });
     }
-
-    // Update the prescription status
+ 
+    if (!mongoose.Types.ObjectId.isValid(prescriptionId)) {
+      return res.status(400).json({ message: "Invalid prescription ID" });
+    }
+ 
     const prescription = await Prescription.findByIdAndUpdate(
       prescriptionId,
       { status },
-      { new: true } // Return the updated document
+      { new: true }
     );
-
+ 
     if (!prescription) {
       return res.status(404).json({ message: "Prescription not found." });
     }
-
+ 
     res.status(200).json({
       message: "Prescription status updated successfully.",
       prescription,
     });
   } catch (error) {
-    console.error("Error updating prescription status:", error);
+    console.error("updatePrescriptionStatus error:", error);
     res.status(500).json({ message: "Error updating prescription status", error: error.message });
   }
 };
+ 
 
 
 

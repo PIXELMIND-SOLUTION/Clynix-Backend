@@ -3147,6 +3147,327 @@ export const bulkDeleteNotifications = async (req, res) => {
 
 
 // GET endpoint for user to fetch pending prescription order previews
+// export const getPendingPrescriptionPreviews = async (req, res) => {
+//   try {
+//     const { userId } = req.params;
+
+//     if (!mongoose.Types.ObjectId.isValid(userId)) {
+//       return res.status(400).json({ message: "Invalid user ID" });
+//     }
+
+//     const user = await User.findById(userId);
+//     if (!user) {
+//       return res.status(404).json({ message: "User not found" });
+//     }
+
+//     // Filter notifications that are prescription order previews and not read/acted upon
+//     const pendingPreviews = user.notifications.filter(
+//       notification => 
+//         notification.type === "prescription_order_preview" && 
+//         notification.read === false &&
+//         notification.orderPreview // Ensure it has orderPreview data
+//     );
+
+//     if (pendingPreviews.length === 0) {
+//       return res.status(200).json({
+//         success: true,
+//         message: "No pending prescription order previews found",
+//         previews: []
+//       });
+//     }
+
+//     // Format the previews for response
+//     const formattedPreviews = pendingPreviews.map(preview => ({
+//       notificationId: preview._id,
+//       prescriptionId: preview.prescriptionId,
+//       vendorId: preview.vendorId,
+//       orderPreview: preview.orderPreview,
+//       message: preview.message,
+//       timestamp: preview.timestamp
+//     }));
+
+//     return res.status(200).json({
+//       success: true,
+//       message: "Pending prescription order previews fetched successfully",
+//       count: formattedPreviews.length,
+//       previews: formattedPreviews
+//     });
+
+//   } catch (error) {
+//     console.error("Error fetching pending prescription previews:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: "Server error",
+//       error: error.message
+//     });
+//   }
+// };
+
+
+// ============================================
+// UPDATED: confirmPrescriptionOrder with proper delivery charge handling
+// ============================================
+export const confirmPrescriptionOrder = async (req, res) => {
+  try {
+    const { userId, prescriptionId } = req.params;
+    const { action } = req.body;
+ 
+    // ── basic validation ──────────────────────────────────────────────────────
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID" });
+    }
+    if (!mongoose.Types.ObjectId.isValid(prescriptionId)) {
+      return res.status(400).json({ message: "Invalid prescription ID" });
+    }
+    if (!action || !["confirm", "reject"].includes(action)) {
+      return res.status(400).json({
+        message: "action ('confirm' or 'reject') is required",
+      });
+    }
+ 
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+ 
+    // ── find the notification by prescriptionId ─────────────────────────────────
+    const notifIdx = (user.notifications || []).findIndex(
+      n =>
+        n.type === "prescription_order_preview" &&
+        n.prescriptionId?.toString() === prescriptionId &&
+        n.read === false
+    );
+ 
+    if (notifIdx === -1) {
+      return res.status(404).json({ 
+        message: "Pending prescription order preview not found for this prescription" 
+      });
+    }
+ 
+    const notification = user.notifications[notifIdx];
+    const { orderPreview, vendorId } = notification;
+ 
+    if (!orderPreview) {
+      return res.status(400).json({ message: "Notification does not contain an order preview" });
+    }
+ 
+    // ── fetch prescription & pharmacy ─────────────────────────────────────────
+    const prescription = await Prescription.findById(prescriptionId);
+    if (!prescription) return res.status(404).json({ message: "Prescription not found" });
+ 
+    const pharmacy = await Pharmacy.findById(vendorId);
+    if (!pharmacy) return res.status(404).json({ message: "Pharmacy not found" });
+ 
+    // ══════════════════════════════════════
+    // REJECT - User side
+    // ══════════════════════════════════════
+    if (action === "reject") {
+      user.notifications.splice(notifIdx, 1);
+      await user.save();
+ 
+      prescription.status = "Rejected by User";
+      await prescription.save();
+ 
+      pharmacy.notifications = pharmacy.notifications || [];
+      pharmacy.notifications.push({
+        type:          "prescription_order_rejected",
+        message:       `User rejected the prescription order preview.`,
+        timestamp:     new Date(),
+        read:          false,
+        prescriptionId,
+      });
+      await pharmacy.save();
+ 
+      return res.status(200).json({ 
+        success: true, 
+        message: "Order preview rejected successfully" 
+      });
+    }
+ 
+    // ══════════════════════════════════════
+    // CONFIRM → create order - User side
+    // ══════════════════════════════════════
+ 
+    // remove the notification before creating order
+    user.notifications.splice(notifIdx, 1);
+    await user.save();
+ 
+    // create Order document with valid status
+    const newOrder = new Order({
+      userId,
+      vendorId,
+      pharmacyId: vendorId,
+      deliveryAddress:  orderPreview.deliveryAddress,
+      orderItems:       orderPreview.orderItems,
+      subTotal:         orderPreview.subTotal,
+      platformFee:      orderPreview.platformFee,
+      deliveryCharge:   orderPreview.deliveryCharge,
+      totalAmount:      orderPreview.totalAmount,
+      notes:            orderPreview.notes            || "",
+      paymentMethod:    orderPreview.paymentMethod,
+      paymentStatus:    orderPreview.paymentStatus,
+      status:           "Pending",  // ✅ Valid status
+      isPrescriptionOrder: true,
+      prescriptionId,
+      statusTimeline: [
+        {
+          status:    "Pending",
+          message:   "Order confirmed by user",
+          timestamp: new Date(),
+        },
+      ],
+      pharmacyResponse: "Accepted",
+      pharmacyResponses: [
+        {
+          pharmacyId:   vendorId,
+          status:       "Accepted",
+          respondedAt:  new Date(),
+        },
+      ],
+    });
+ 
+    await newOrder.save();
+ 
+    prescription.status = "Order Created";
+    await prescription.save();
+ 
+    // ── find nearest rider to the PHARMACY ───────────────────────────────────
+    const pharmacyLat = parseFloat(pharmacy.latitude);
+    const pharmacyLng = parseFloat(pharmacy.longitude);
+ 
+    let assignedRider  = null;
+    let minDistance    = Infinity;
+ 
+    if (!isNaN(pharmacyLat) && !isNaN(pharmacyLng)) {
+      const riders = await Rider.find({
+        status:               "online",
+        drivingLicenseStatus: "Approved",
+      });
+ 
+      for (const rider of riders) {
+        const rLat = parseFloat(rider.latitude);
+        const rLng = parseFloat(rider.longitude);
+        if (isNaN(rLat) || isNaN(rLng)) continue;
+ 
+        const dist = getDistanceInKm(pharmacyLat, pharmacyLng, rLat, rLng);
+        if (dist < minDistance) {
+          minDistance   = dist;
+          assignedRider = rider;
+        }
+      }
+    }
+ 
+    // ── assign rider ──────────────────────────────────────────────────────────
+    if (assignedRider) {
+      newOrder.assignedRider       = assignedRider._id;
+      newOrder.assignedRiderStatus = "Assigned";
+      newOrder.status              = "Accepted";  // ✅ Valid status (not "Rider Assigned")
+      newOrder.statusTimeline.push({
+        status:    "Accepted",
+        message:   `Rider ${assignedRider.name} assigned to pick up from ${pharmacy.name}`,
+        timestamp: new Date(),
+      });
+      await newOrder.save();
+ 
+      // notify rider
+      assignedRider.notifications = assignedRider.notifications || [];
+      assignedRider.notifications.push({
+        type:      "new_order",
+        message:   `New prescription order #${newOrder._id.toString().slice(-6)} assigned. Pick up from ${pharmacy.name}.`,
+        orderId:   newOrder._id,
+        timestamp: new Date(),
+        read:      false,
+      });
+      await assignedRider.save();
+ 
+      // notify pharmacy
+      pharmacy.notifications = pharmacy.notifications || [];
+      pharmacy.notifications.push({
+        type:      "rider_assigned",
+        message:   `Rider ${assignedRider.name} assigned to order #${newOrder._id.toString().slice(-6)}.`,
+        orderId:   newOrder._id,
+        riderId:   assignedRider._id,
+        timestamp: new Date(),
+        read:      false,
+      });
+      await pharmacy.save();
+ 
+      // notify user
+      user.notifications.push({
+        type:      "order_confirmed",
+        message:   `Your prescription order #${newOrder._id.toString().slice(-6)} is confirmed and a rider has been assigned.`,
+        orderId:   newOrder._id,
+        timestamp: new Date(),
+        read:      false,
+      });
+      await user.save();
+ 
+    } else {
+      // no rider available
+      newOrder.status = "Pending";  // ✅ Valid status
+      await newOrder.save();
+ 
+      user.notifications.push({
+        type:      "order_confirmed",
+        message:   `Your prescription order #${newOrder._id.toString().slice(-6)} is confirmed. Waiting for a rider.`,
+        orderId:   newOrder._id,
+        timestamp: new Date(),
+        read:      false,
+      });
+      await user.save();
+ 
+      pharmacy.notifications = pharmacy.notifications || [];
+      pharmacy.notifications.push({
+        type:      "order_confirmed",
+        message:   `Order #${newOrder._id.toString().slice(-6)} confirmed by user. No rider available yet.`,
+        orderId:   newOrder._id,
+        timestamp: new Date(),
+        read:      false,
+      });
+      await pharmacy.save();
+    }
+ 
+    // ── populate & respond ────────────────────────────────────────────────────
+    const populated = await Order.findById(newOrder._id)
+      .populate("userId",        "name email mobile")
+      .populate("assignedRider", "name phone email")
+      .populate({
+        path:   "orderItems.medicineId",
+        select: "name mrp images description",
+      });
+ 
+    return res.status(201).json({
+      success: true,
+      message: assignedRider
+        ? "Order confirmed and rider assigned successfully"
+        : "Order confirmed. Waiting for rider assignment.",
+      order: {
+        _id:             populated._id,
+        orderNumber:     `ORD${populated._id.toString().slice(-6)}`,
+        isPrescriptionOrder: true,
+        prescriptionId:  populated.prescriptionId,
+        deliveryAddress: populated.deliveryAddress,
+        orderItems:      populated.orderItems,
+        subTotal:        populated.subTotal,
+        platformFee:     populated.platformFee,
+        deliveryCharge:  populated.deliveryCharge,
+        totalAmount:     populated.totalAmount,
+        paymentMethod:   populated.paymentMethod,
+        paymentStatus:   populated.paymentStatus,
+        status:          populated.status,
+        statusTimeline:  populated.statusTimeline,
+        assignedRider:   populated.assignedRider,
+        createdAt:       populated.createdAt,
+      },
+    });
+ 
+  } catch (error) {
+    console.error("confirmPrescriptionOrder error:", error);
+    return res.status(500).json({ success: false, message: "Server Error", error: error.message });
+  }
+};
+
+
+
+// Replace your existing getPendingPrescriptionPreviews function with this
 export const getPendingPrescriptionPreviews = async (req, res) => {
   try {
     const { userId } = req.params;
@@ -3156,22 +3477,23 @@ export const getPendingPrescriptionPreviews = async (req, res) => {
     }
 
     const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    // Filter notifications that are prescription order previews and not read/acted upon
-    const pendingPreviews = user.notifications.filter(
-      notification => 
-        notification.type === "prescription_order_preview" && 
-        notification.read === false &&
-        notification.orderPreview // Ensure it has orderPreview data
+    console.log("🔍 User found. Total notifications:", user.notifications?.length || 0);
+    console.log("📋 All notification types:", user.notifications?.map(n => n.type));
+
+    // Filter notifications that are prescription order previews and not read
+    const pendingPreviews = (user.notifications || []).filter(
+      n => n.type === "prescription_order_preview" && n.read === false
     );
+
+    console.log("🎯 Pending previews count:", pendingPreviews.length);
 
     if (pendingPreviews.length === 0) {
       return res.status(200).json({
         success: true,
         message: "No pending prescription order previews found",
+        count: 0,
         previews: []
       });
     }
@@ -3183,7 +3505,8 @@ export const getPendingPrescriptionPreviews = async (req, res) => {
       vendorId: preview.vendorId,
       orderPreview: preview.orderPreview,
       message: preview.message,
-      timestamp: preview.timestamp
+      timestamp: preview.timestamp,
+      read: preview.read
     }));
 
     return res.status(200).json({
@@ -3194,275 +3517,8 @@ export const getPendingPrescriptionPreviews = async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Error fetching pending prescription previews:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Server error",
-      error: error.message
-    });
-  }
-};
-
-
-export const confirmPrescriptionOrder = async (req, res) => {
-  try {
-    const { userId } = req.params;
-    // orderPreview is the full preview object returned from previewOrderFromPrescription
-    const { orderPreview, action } = req.body; // action: "confirm" | "reject"
- 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ message: "Invalid user ID" });
-    }
- 
-    if (!orderPreview) {
-      return res.status(400).json({ message: "orderPreview is required" });
-    }
- 
-    if (!action || !["confirm", "reject"].includes(action)) {
-      return res.status(400).json({
-        message: "action must be 'confirm' or 'reject'",
-      });
-    }
- 
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ message: "User not found" });
- 
-    const { prescriptionId, vendorId } = orderPreview;
- 
-    // Validate IDs from preview
-    if (
-      !mongoose.Types.ObjectId.isValid(prescriptionId) ||
-      !mongoose.Types.ObjectId.isValid(vendorId) ||
-      !mongoose.Types.ObjectId.isValid(userId)
-    ) {
-      return res.status(400).json({ message: "Invalid IDs in orderPreview" });
-    }
- 
-    const prescription = await Prescription.findById(prescriptionId);
-    if (!prescription) {
-      return res.status(404).json({ message: "Prescription not found" });
-    }
- 
-    const pharmacy = await Pharmacy.findById(vendorId);
-    if (!pharmacy) {
-      return res.status(404).json({ message: "Pharmacy not found" });
-    }
- 
-    // ====================================================
-    // USER REJECTS ORDER
-    // ====================================================
-    if (action === "reject") {
-      // Notify vendor of rejection
-      pharmacy.notifications = pharmacy.notifications || [];
-      pharmacy.notifications.push({
-        status: "Rejected",
-        message: `User rejected the prescription order preview.`,
-        timestamp: new Date(),
-        read: false,
-      });
-      await pharmacy.save();
- 
-      // Update prescription status back to pending
-      prescription.status = "Pending";
-      await prescription.save();
- 
-      return res.status(200).json({
-        message: "Order preview rejected. Prescription status reset to Pending.",
-      });
-    }
- 
-    // ====================================================
-    // USER CONFIRMS ORDER — NOW SAVE TO DB
-    // ====================================================
-    const newOrder = new Order({
-      userId,
-      vendorId,
-      pharmacyId: vendorId,
-      deliveryAddress: orderPreview.deliveryAddress,
-      orderItems: orderPreview.orderItems,
-      subTotal: orderPreview.subTotal,
-      platformFee: orderPreview.platformFee,
-      deliveryCharge: orderPreview.deliveryCharge,
-      totalAmount: orderPreview.totalAmount,
-      notes: orderPreview.notes || "",
-      paymentMethod: orderPreview.paymentMethod || "Cash on Delivery",
-      paymentStatus: orderPreview.paymentStatus || "Pending",
-      status: "Pending",
-      isPrescriptionOrder: true,
-      prescriptionId,
-      statusTimeline: [
-        {
-          status: "Pending",
-          message: "Order confirmed by user from prescription preview",
-          timestamp: new Date(),
-        },
-      ],
-      pharmacyResponse: "Accepted",
-      pharmacyResponses: [
-        {
-          pharmacyId: vendorId,
-          status: "Accepted",
-          respondedAt: new Date(),
-        },
-      ],
-    });
- 
-    await newOrder.save();
- 
-    // Update prescription status
-    prescription.status = "Order Created";
-    await prescription.save();
- 
-    // Notify pharmacy
-    pharmacy.notifications = pharmacy.notifications || [];
-    pharmacy.notifications.push({
-      orderId: newOrder._id,
-      status: "Pending",
-      message: `User confirmed the prescription order. New order #${newOrder._id
-        .toString()
-        .slice(-6)} created.`,
-      timestamp: new Date(),
-      read: false,
-    });
-    await pharmacy.save();
- 
-    // Notify user
-    user.notifications = user.notifications || [];
-    user.notifications.push({
-      orderId: newOrder._id,
-      status: "Pending",
-      message: `Your prescription order has been placed successfully.`,
-      timestamp: new Date(),
-      read: false,
-    });
-    await user.save();
- 
-    // ====================================================
-    // AUTO-ASSIGN NEAREST RIDER
-    // ====================================================
-    let assignedRider = null;
-    let minDistance = Infinity;
- 
-    const riders = await Rider.find({
-      status: "online",
-      drivingLicenseStatus: "Approved",
-    });
- 
-    let refLat = null;
-    let refLng = null;
- 
-    if (
-      user.location &&
-      user.location.coordinates &&
-      user.location.coordinates.length === 2
-    ) {
-      [refLng, refLat] = user.location.coordinates;
-    } else if (
-      pharmacy.location &&
-      pharmacy.location.coordinates &&
-      pharmacy.location.coordinates.length === 2
-    ) {
-      [refLng, refLat] = pharmacy.location.coordinates;
-    }
- 
-    if (refLat && refLng) {
-      for (const rider of riders) {
-        if (!rider.latitude || !rider.longitude) continue;
-        const toRad = (v) => (v * Math.PI) / 180;
-        const R = 6371;
-        const dLat = toRad(parseFloat(rider.latitude) - refLat);
-        const dLon = toRad(parseFloat(rider.longitude) - refLng);
-        const a =
-          Math.sin(dLat / 2) ** 2 +
-          Math.cos(toRad(refLat)) *
-            Math.cos(toRad(parseFloat(rider.latitude))) *
-            Math.sin(dLon / 2) ** 2;
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = R * c;
-        if (distance < minDistance) {
-          minDistance = distance;
-          assignedRider = rider;
-        }
-      }
-    }
- 
-    if (assignedRider) {
-      const baseFare = assignedRider.baseFare || 30;
-      const ratePerKm = 5;
-      const riderDeliveryCharge =
-        Math.ceil(minDistance * ratePerKm) + baseFare;
- 
-      newOrder.assignedRider = assignedRider._id;
-      newOrder.assignedRiderStatus = "Assigned";
-      newOrder.deliveryCharge = riderDeliveryCharge;
-      newOrder.totalAmount =
-        newOrder.subTotal + newOrder.platformFee + riderDeliveryCharge;
- 
-      newOrder.statusTimeline.push({
-        status: "Rider Assigned",
-        message: `Rider ${assignedRider.name} assigned to order`,
-        timestamp: new Date(),
-      });
- 
-      assignedRider.notifications = assignedRider.notifications || [];
-      assignedRider.notifications.push({
-        message: `New prescription order assigned: Order #${newOrder._id
-          .toString()
-          .slice(-6)}`,
-        orderId: newOrder._id,
-        timestamp: new Date(),
-        read: false,
-      });
- 
-      await assignedRider.save();
-      await newOrder.save();
-    }
- 
-    // Populate for response
-    const populatedOrder = await Order.findById(newOrder._id)
-      .populate("userId", "name email mobile")
-      .populate("assignedRider", "name phone email")
-      .populate({
-        path: "orderItems.medicineId",
-        select: "name mrp images description",
-      });
- 
-    return res.status(201).json({
-      message: "Prescription order confirmed and placed successfully.",
-      order: {
-        _id: populatedOrder._id,
-        isPrescriptionOrder: true,
-        prescriptionId: populatedOrder.prescriptionId,
-        userId: populatedOrder.userId,
-        deliveryAddress: populatedOrder.deliveryAddress,
-        orderItems: populatedOrder.orderItems.map((item) => ({
-          medicineId: item.medicineId,
-          name: item.name,
-          quantity: item.quantity,
-          price: item.price,
-          totalPrice: (item.price || 0) * (item.quantity || 1),
-          dosage: item.dosage,
-          instructions: item.instructions,
-        })),
-        subTotal: populatedOrder.subTotal,
-        platformFee: populatedOrder.platformFee,
-        deliveryCharge: populatedOrder.deliveryCharge,
-        totalAmount: populatedOrder.totalAmount,
-        paymentMethod: populatedOrder.paymentMethod,
-        paymentStatus: populatedOrder.paymentStatus,
-        status: populatedOrder.status,
-        notes: populatedOrder.notes,
-        statusTimeline: populatedOrder.statusTimeline,
-        assignedRider: populatedOrder.assignedRider,
-        createdAt: populatedOrder.createdAt,
-      },
-    });
-  } catch (error) {
-    console.error("Error confirming prescription order:", error);
-    return res.status(500).json({
-      message: "Server Error",
-      error: error.message,
-    });
+    console.error("getPendingPrescriptionPreviews error:", error);
+    return res.status(500).json({ success: false, message: "Server error", error: error.message });
   }
 };
  

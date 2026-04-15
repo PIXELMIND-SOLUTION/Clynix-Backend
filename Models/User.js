@@ -62,9 +62,27 @@ const userSchema = new mongoose.Schema({
     read: {
       type: Boolean,
       default: false
+    },
+  
+  type: {
+        type: String,
+        enum: ['Order', 'Pharmacy', 'PeriodicOrder', 'prescription_order_preview', 'order_confirmed', 'rider_assigned'],
+        default: 'Order'
+      },
+      prescriptionId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Prescription'
+      },
+      vendorId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Pharmacy'
+      },
+      orderPreview: {
+        type: mongoose.Schema.Types.Mixed
+      }
     }
-  }
 ],
+
   profileImage: {
     type: String,
     default:
