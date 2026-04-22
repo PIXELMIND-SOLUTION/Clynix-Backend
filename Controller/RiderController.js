@@ -2592,6 +2592,21 @@ export const markOrderAsDeliveredController = async (req, res) => {
       }
     }
 
+        // ===============================
+    // 🔥 ADD NOTIFICATION FOR THE USER (FIX)
+    // ===============================
+    const user = await User.findById(order.userId);
+    if (user) {
+      user.notifications.push({
+        orderId: order._id,
+        status: "Completed",
+        message: "Your order has been delivered successfully.",
+        timestamp: new Date(),
+        read: false,
+      });
+      await user.save();
+    }
+
     // ===============================
     // Save Order & Rider
     // ===============================

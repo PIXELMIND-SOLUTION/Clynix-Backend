@@ -1954,29 +1954,52 @@ export const reorderDeliveredOrder = async (req, res) => {
 
     const platformFee = 10;
 
-    // ✅ Find nearest rider
-    const allRiders = await Rider.find();
+    // ✅ Find nearest rider to calculate delivery charge based on admin's configuration
     let nearestRider = null;
     let minDistance = Infinity;
+    let deliveryCharge = 0;
 
-    const userLat = user.location?.coordinates[1] || 0;
-    const userLon = user.location?.coordinates[0] || 0;
+    const userLat = user.location?.coordinates?.[1] || 0;
+    const userLon = user.location?.coordinates?.[0] || 0;
 
-    for (let rider of allRiders) {
-      if (!rider.latitude || !rider.longitude) continue;
+    // Get all online riders
+    const allRiders = await Rider.find({ status: "online" });
+    
+    if (allRiders.length > 0) {
+      for (let rider of allRiders) {
+        if (!rider.latitude || !rider.longitude) continue;
 
-      const distance = calculateDistance(
-        [parseFloat(rider.longitude), parseFloat(rider.latitude)],
-        [userLon, userLat]
-      );
+        const distance = calculateDistance(
+          [parseFloat(rider.longitude), parseFloat(rider.latitude)],
+          [userLon, userLat]
+        );
 
-      if (distance < minDistance) {
-        minDistance = distance;
-        nearestRider = rider;
+        if (distance < minDistance) {
+          minDistance = distance;
+          nearestRider = rider;
+        }
       }
     }
 
-    const deliveryCharge = nearestRider ? calculateDeliveryCharge(minDistance) : 0;
+    // ✅ Calculate delivery charge based on admin's configuration (from rider settings)
+    if (nearestRider) {
+      const baseFare = nearestRider.baseFare || 30;
+      const baseDistanceKm = nearestRider.baseDistanceKm || 2;
+      const additionalChargePerKm = nearestRider.additionalChargePerKm || 10;
+      
+      if (minDistance <= baseDistanceKm) {
+        deliveryCharge = baseFare;
+      } else {
+        const extraDistance = minDistance - baseDistanceKm;
+        const additionalCharge = extraDistance * additionalChargePerKm;
+        deliveryCharge = baseFare + additionalCharge;
+      }
+      deliveryCharge = Math.round(deliveryCharge);
+    } else {
+      // Default delivery charge if no rider found (admin configured default)
+      deliveryCharge = 40;
+    }
+
     const totalAmount = subTotal + platformFee + deliveryCharge;
 
     if (isNaN(totalAmount)) {
@@ -2009,7 +2032,6 @@ export const reorderDeliveredOrder = async (req, res) => {
           });
         }
 
-        // ✅ Set to "Completed" instead of "Captured"
         paymentStatus = "Completed";
       } catch (err) {
         console.error("Razorpay Error:", err);
@@ -2056,6 +2078,7 @@ export const reorderDeliveredOrder = async (req, res) => {
         timestamp: new Date(),
       });
 
+      nearestRider.notifications = nearestRider.notifications || [];
       nearestRider.notifications.push({
         message: `New order assigned via reorder from ${user.name}`,
         order: {
@@ -2105,7 +2128,6 @@ export const reorderDeliveredOrder = async (req, res) => {
     });
   }
 };
-
 
 
 export const togglePeriodicMedsPlan = async (req, res) => {
@@ -2392,28 +2414,176 @@ export const createPeriodicOrders = async (req, res) => {
 
 
 
+// export const getUserPeriodicOrders = async (req, res) => {
+//   try {
+//     const { userId } = req.params;
+
+//     // Validate userId
+//     if (!mongoose.Types.ObjectId.isValid(userId)) {
+//       return res.status(400).json({ message: "Invalid user ID" });
+//     }
+
+//     // Check if user exists
+//     const userExists = await User.findById(userId);
+//     if (!userExists) {
+//       return res.status(404).json({ message: "User not found" });
+//     }
+
+//     // Fetch orders with planType (periodic orders)
+//     const orders = await Order.find({
+//       userId,
+//       planType: { $exists: true, $ne: null, $in: ["Weekly", "Monthly"] }
+//     })
+//       .populate("assignedRider", "name phone email")
+//       .populate("orderByVendor", "name phone email") // Changed from assignedPharmacy to orderByVendor
+//       .sort({ createdAt: -1 })
+//       .lean();
+
+//     if (!orders || orders.length === 0) {
+//       return res.status(200).json({ 
+//         success: true, 
+//         count: 0, 
+//         orders: [] 
+//       });
+//     }
+
+//     // Process each order
+//     const formattedOrders = await Promise.all(
+//       orders.map(async (order) => {
+//         // Process order items with medicine details
+//         const orderItems = await Promise.all(
+//           order.orderItems.map(async (item) => {
+//             // If item has medicineId, fetch medicine details
+//             if (item.medicineId) {
+//               const med = await Medicine.findById(item.medicineId).lean();
+//               return {
+//                 _id: item._id,
+//                 medicineId: item.medicineId,
+//                 name: item.name || med?.name || "Medicine",
+//                 quantity: item.quantity,
+//                 price: item.price || med?.mrp || 0,
+//                 image: med?.images && med.images.length > 0 ? med.images[0] : null,
+//               };
+//             }
+//             // For non-medicine items like coupon discounts
+//             return {
+//               _id: item._id,
+//               medicineId: null,
+//               name: item.name || "Item",
+//               quantity: item.quantity,
+//               price: item.price || 0,
+//               image: null,
+//             };
+//           })
+//         );
+
+//         // Format delivery date
+//         let deliveryDate = null;
+//         if (order.deliveryDate) {
+//           const date = new Date(order.deliveryDate);
+//           if (!isNaN(date.getTime())) {
+//             deliveryDate = date.toISOString().split("T")[0];
+//           }
+//         }
+
+//         // If no deliveryDate but order has createdAt, use that
+//         if (!deliveryDate && order.createdAt) {
+//           const date = new Date(order.createdAt);
+//           if (!isNaN(date.getTime())) {
+//             deliveryDate = date.toISOString().split("T")[0];
+//           }
+//         }
+
+//         // Get pharmacy response status
+//         let pharmacyResponseStatus = "Pending";
+//         if (order.pharmacyResponses && order.pharmacyResponses.length > 0) {
+//           // Check if any pharmacy accepted
+//           const accepted = order.pharmacyResponses.some(r => r.status === "Accepted");
+//           const rejected = order.pharmacyResponses.some(r => r.status === "Rejected");
+          
+//           if (accepted) pharmacyResponseStatus = "Accepted";
+//           else if (rejected) pharmacyResponseStatus = "Rejected";
+//           else pharmacyResponseStatus = "Pending";
+//         }
+
+//         return {
+//           _id: order._id,
+//           planType: order.planType || "One-time",
+//           deliveryDate,
+//           deliveryAddress: order.deliveryAddress || null,
+//           orderItems,
+//           subTotal: order.subtotal || order.subTotal || 0,
+//           totalAmount: order.totalAmount || order.total || 0,
+//           platformFee: order.platformFee || 0,
+//           deliveryCharge: order.deliveryCharge || 0,
+//           discountAmount: order.discountAmount || 0,
+//           couponCode: order.couponCode || null,
+//           paymentMethod: order.paymentMethod || "Cash on Delivery",
+//           paymentStatus: order.paymentStatus || "Pending",
+//           status: order.status || "Pending",
+//           pharmacyResponse: pharmacyResponseStatus,
+//           pharmacy: order.orderByVendor
+//             ? {
+//                 _id: order.orderByVendor._id,
+//                 name: order.orderByVendor.name,
+//                 phone: order.orderByVendor.phone,
+//                 email: order.orderByVendor.email,
+//               }
+//             : null,
+//           rider: order.assignedRider
+//             ? {
+//                 _id: order.assignedRider._id,
+//                 name: order.assignedRider.name,
+//                 phone: order.assignedRider.phone,
+//                 email: order.assignedRider.email,
+//               }
+//             : null,
+//           notes: order.notes || "",
+//           voiceNoteUrl: order.voiceNoteUrl || null,
+//           statusTimeline: order.statusTimeline || [],
+//           createdAt: order.createdAt,
+//           updatedAt: order.updatedAt,
+//         };
+//       })
+//     );
+
+//     return res.status(200).json({
+//       success: true,
+//       count: formattedOrders.length,
+//       orders: formattedOrders,
+//     });
+
+//   } catch (error) {
+//     console.error("Error fetching user periodic orders:", error);
+//     return res.status(500).json({ 
+//       success: false,
+//       message: "Server error", 
+//       error: error.message 
+//     });
+//   }
+// };
+
+
 export const getUserPeriodicOrders = async (req, res) => {
   try {
     const { userId } = req.params;
 
-    // Validate userId
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ message: "Invalid user ID" });
     }
 
-    // Check if user exists
     const userExists = await User.findById(userId);
     if (!userExists) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Fetch orders with planType (periodic orders)
+    // ✅ Fix: Accept both "Weekly"/"Monthly" and "weekly"/"monthly"
     const orders = await Order.find({
       userId,
-      planType: { $exists: true, $ne: null, $in: ["Weekly", "Monthly"] }
+      planType: { $in: ["Weekly", "Monthly", "weekly", "monthly"] }
     })
       .populate("assignedRider", "name phone email")
-      .populate("orderByVendor", "name phone email") // Changed from assignedPharmacy to orderByVendor
+      .populate("orderByVendor", "name phone email")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -2425,13 +2595,11 @@ export const getUserPeriodicOrders = async (req, res) => {
       });
     }
 
-    // Process each order
+    // Rest of the function remains exactly the same...
     const formattedOrders = await Promise.all(
       orders.map(async (order) => {
-        // Process order items with medicine details
         const orderItems = await Promise.all(
           order.orderItems.map(async (item) => {
-            // If item has medicineId, fetch medicine details
             if (item.medicineId) {
               const med = await Medicine.findById(item.medicineId).lean();
               return {
@@ -2443,7 +2611,6 @@ export const getUserPeriodicOrders = async (req, res) => {
                 image: med?.images && med.images.length > 0 ? med.images[0] : null,
               };
             }
-            // For non-medicine items like coupon discounts
             return {
               _id: item._id,
               medicineId: null,
@@ -2455,7 +2622,6 @@ export const getUserPeriodicOrders = async (req, res) => {
           })
         );
 
-        // Format delivery date
         let deliveryDate = null;
         if (order.deliveryDate) {
           const date = new Date(order.deliveryDate);
@@ -2463,8 +2629,6 @@ export const getUserPeriodicOrders = async (req, res) => {
             deliveryDate = date.toISOString().split("T")[0];
           }
         }
-
-        // If no deliveryDate but order has createdAt, use that
         if (!deliveryDate && order.createdAt) {
           const date = new Date(order.createdAt);
           if (!isNaN(date.getTime())) {
@@ -2472,13 +2636,10 @@ export const getUserPeriodicOrders = async (req, res) => {
           }
         }
 
-        // Get pharmacy response status
         let pharmacyResponseStatus = "Pending";
         if (order.pharmacyResponses && order.pharmacyResponses.length > 0) {
-          // Check if any pharmacy accepted
           const accepted = order.pharmacyResponses.some(r => r.status === "Accepted");
           const rejected = order.pharmacyResponses.some(r => r.status === "Rejected");
-          
           if (accepted) pharmacyResponseStatus = "Accepted";
           else if (rejected) pharmacyResponseStatus = "Rejected";
           else pharmacyResponseStatus = "Pending";
@@ -2540,9 +2701,6 @@ export const getUserPeriodicOrders = async (req, res) => {
     });
   }
 };
-
-
-
 
 export const cancelPeriodicOrder = async (req, res) => {
   try {
@@ -2997,7 +3155,6 @@ export const deleteNotification = async (req, res) => {
   try {
     const { userId, notificationId } = req.params;
 
-    // Validate IDs
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ message: "Invalid user ID" });
     }
@@ -3005,14 +3162,12 @@ export const deleteNotification = async (req, res) => {
       return res.status(400).json({ message: "Invalid notification ID" });
     }
 
-    // Find user and remove specific notification
+    // Convert to ObjectId for safe matching
+    const objectId = new mongoose.Types.ObjectId(notificationId);
+
     const user = await User.findByIdAndUpdate(
       userId,
-      { 
-        $pull: { 
-          notifications: { _id: notificationId } 
-        } 
-      },
+      { $pull: { notifications: { _id: objectId } } },
       { new: true }
     ).select('notifications');
 
@@ -3041,38 +3196,22 @@ export const bulkDeleteNotifications = async (req, res) => {
     const { userId } = req.params;
     const { notificationIds } = req.body;
 
-    console.log('=== Bulk Delete Request ===');
-    console.log('User ID:', userId);
-    console.log('Notification IDs to delete:', notificationIds);
-
-    // Validate userId
     if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Invalid user ID" 
-      });
+      return res.status(400).json({ success: false, message: "Invalid user ID" });
     }
 
-    // Validate notificationIds
     if (!notificationIds || !Array.isArray(notificationIds) || notificationIds.length === 0) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         success: false,
-        message: "Please provide an array of notification IDs to delete" 
+        message: "Please provide an array of notification IDs to delete"
       });
     }
 
-    // Find user with notifications
     const user = await User.findById(userId);
-    
     if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        message: "User not found" 
-      });
+      return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    console.log('Total notifications before deletion:', user.notifications.length);
-    
     if (user.notifications.length === 0) {
       return res.status(200).json({
         success: true,
@@ -3082,56 +3221,49 @@ export const bulkDeleteNotifications = async (req, res) => {
       });
     }
 
-    // Log all existing notification IDs for debugging
-    const existingIds = user.notifications.map(n => n._id.toString());
-    console.log('Existing notification IDs:', existingIds);
-    console.log('IDs trying to delete:', notificationIds);
+    // Filter only valid ObjectIds and those that actually exist in the user's notifications
+    const validObjectIds = [];
+    const invalidIds = [];
 
-    // Find which IDs exist and which don't
-    const existingToDelete = notificationIds.filter(id => existingIds.includes(id));
-    const nonExistingIds = notificationIds.filter(id => !existingIds.includes(id));
-
-    console.log('IDs that exist:', existingToDelete);
-    console.log('IDs that do not exist:', nonExistingIds);
-
-    if (existingToDelete.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "None of the provided notification IDs exist for this user",
-        nonExistingIds: nonExistingIds,
-        existingIdsInUser: existingIds,
-        hint: "Please check the notification IDs - they may belong to a different user or have been already deleted"
-      });
+    for (const id of notificationIds) {
+      if (mongoose.Types.ObjectId.isValid(id)) {
+        // Check if this ID exists in the user's notifications
+        const exists = user.notifications.some(n => n._id.toString() === id);
+        if (exists) {
+          validObjectIds.push(new mongoose.Types.ObjectId(id));
+        } else {
+          invalidIds.push(id);
+        }
+      } else {
+        invalidIds.push(id);
+      }
     }
 
-    // Convert IDs to ObjectId for MongoDB query
-    const objectIdsToDelete = existingToDelete.map(id => new mongoose.Types.ObjectId(id));
+    if (validObjectIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "None of the provided notification IDs are valid or exist for this user",
+        invalidIds: invalidIds
+      });
+    }
 
     // Perform the deletion
     const updatedUser = await User.findByIdAndUpdate(
       userId,
-      { 
-        $pull: { 
-          notifications: { _id: { $in: objectIdsToDelete } } 
-        } 
-      },
+      { $pull: { notifications: { _id: { $in: validObjectIds } } } },
       { new: true }
-    );
+    ).select('notifications');
 
-    const deletedCount = existingToDelete.length;
+    const deletedCount = validObjectIds.length;
     const remainingCount = updatedUser.notifications.length;
-
-    console.log(`Successfully deleted ${deletedCount} notifications`);
-    console.log(`Remaining notifications: ${remainingCount}`);
 
     return res.status(200).json({
       success: true,
       message: `${deletedCount} notification(s) deleted successfully`,
       deletedCount: deletedCount,
-      nonExistingCount: nonExistingIds.length,
-      nonExistingIds: nonExistingIds.length > 0 ? nonExistingIds : undefined,
-      remainingCount: remainingCount,
-      remainingNotificationIds: updatedUser.notifications.map(n => n._id.toString())
+      nonExistingCount: invalidIds.length,
+      nonExistingIds: invalidIds.length > 0 ? invalidIds : undefined,
+      remainingCount: remainingCount
     });
 
   } catch (error) {
@@ -3139,8 +3271,7 @@ export const bulkDeleteNotifications = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Server error",
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      error: error.message
     });
   }
 };

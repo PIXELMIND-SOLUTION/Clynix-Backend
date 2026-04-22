@@ -43,8 +43,8 @@ const calculateDistance = (coord1, coord2) => {
 
 // Delivery charge calculation per km (adjust rate as needed)
 const calculateDeliveryCharge = (distanceKm) => {
-  const ratePerKm = 5; // 5 currency units per km
-  return Math.ceil(distanceKm * ratePerKm);
+  const ratePerKm = 5;
+  return Math.round(distanceKm * ratePerKm);  // ← matches user side
 };
 
 
@@ -713,14 +713,16 @@ export const updateOrderStatusByVendor = async (req, res) => {
             order.assignedRiderStatus = "Assigned";
 
             const baseFare = nearestRider.baseFare || 30;
-            order.deliveryCharge = calculateDeliveryCharge(minDistance) + baseFare;
+            order.deliveryCharge = Math.round(calculateDeliveryCharge(minDistance) + baseFare);
+
 
             order.statusTimeline.push({
               status: "Rider Assigned",
               message: `Rider ${nearestRider.name} assigned`,
               timestamp: new Date(),
             });
-
+            // Notify user about rider assignment
+            await notifyUser(order.userId._id, "Rider Assigned", `A rider has been assigned to your order #${order._id.toString().slice(-6)} and will pick it up soon.`);
             nearestRider.notifications.push({
               message: "New order assigned to you",
               orderId: order._id,
