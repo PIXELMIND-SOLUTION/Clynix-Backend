@@ -17,6 +17,7 @@ cloudinary.config({
   api_secret: process.env.CLOUD_API_SECRET,
 });
 
+
 export const createPharmacy = async (req, res) => {
   try {
     const {
