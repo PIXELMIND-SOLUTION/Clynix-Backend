@@ -43,8 +43,8 @@ const calculateDistance = (coord1, coord2) => {
 
 // Delivery charge calculation per km (adjust rate as needed)
 const calculateDeliveryCharge = (distanceKm) => {
-  const ratePerKm = 5; // 5 currency units per km
-  return Math.ceil(distanceKm * ratePerKm);
+  const ratePerKm = 5;
+  return Math.round(distanceKm * ratePerKm);  // ← matches user side
 };
 
 
@@ -597,8 +597,7 @@ export const updateOrderStatusByVendor = async (req, res) => {
     if (!order.pharmacyResponses) order.pharmacyResponses = [];
 
     // =============================
-    // FIX: Handle periodic & prescription orders that use assignedPharmacy
-    // instead of pharmacyResponses array
+    // Handle periodic & prescription orders that use assignedPharmacy
     // =============================
     const isPeriodicOrder = order.planType && ["Weekly", "Monthly"].includes(order.planType);
     const isPrescriptionOrder = order.isPrescriptionOrder === true;
@@ -615,7 +614,6 @@ export const updateOrderStatusByVendor = async (req, res) => {
         order.pharmacyId?.toString() === vendorId;
 
       if (isAssignedPharmacy || isPeriodicOrder || isPrescriptionOrder) {
-        // Add a pharmacyResponse entry for this vendor so the rest of the logic works
         order.pharmacyResponses.push({
           pharmacyId: vendorId,
           status: "Pending",
@@ -631,28 +629,59 @@ export const updateOrderStatusByVendor = async (req, res) => {
     // VENDOR REJECTS ORDER
     // =============================
     if (status === "Rejected") {
+      // Update this vendor's response
       order.pharmacyResponses[pharmacyResponseIndex].status = "Rejected";
       order.pharmacyResponses[pharmacyResponseIndex].respondedAt = new Date();
 
+      // Add to rejected pharmacies list
       if (!order.rejectedPharmacies) order.rejectedPharmacies = [];
       if (!order.rejectedPharmacies.includes(vendorId)) {
         order.rejectedPharmacies.push(vendorId);
       }
 
-      order.statusTimeline.push({
-        status: "Rejected",
-        message: `Pharmacy ${vendorId} rejected the order`,
-        timestamp: new Date(),
-      });
+      // ✅ IMPORTANT FIX: Check if ALL pharmacies have rejected
+      const allPharmaciesRejected = order.pharmacyResponses.every(
+        (response) => response.status === "Rejected"
+      );
 
-      await order.save();
-
-      scheduleReassignOrder(order._id);
-
-      return res.status(200).json({
-        message: "Order rejected by pharmacy, will try to reassign.",
-        order,
-      });
+      if (allPharmaciesRejected) {
+        // No pharmacies left to accept - cancel the order
+        order.status = "Cancelled";
+        order.pharmacyResponse = "Rejected";
+        
+        order.statusTimeline.push({
+          status: "Cancelled",
+          message: "All pharmacies rejected the order. Order cancelled.",
+          timestamp: new Date(),
+        });
+        
+        await order.save();
+        
+        return res.status(200).json({
+          message: "All pharmacies rejected. Order cancelled.",
+          order,
+        });
+      } else {
+        // Still have pending pharmacies - keep order pending and schedule reassignment
+        order.pharmacyResponse = "Pending";
+        order.status = "Pending"; // Keep as Pending until all responses are in
+        
+        order.statusTimeline.push({
+          status: "Rejected",
+          message: `Pharmacy ${vendorId} rejected the order`,
+          timestamp: new Date(),
+        });
+        
+        await order.save();
+        
+        // Schedule reassignment to another pharmacy
+        scheduleReassignOrder(order._id);
+        
+        return res.status(200).json({
+          message: "Order rejected by pharmacy, will try to reassign.",
+          order,
+        });
+      }
     }
 
     // =============================
@@ -662,39 +691,33 @@ export const updateOrderStatusByVendor = async (req, res) => {
       order.pharmacyResponses[pharmacyResponseIndex].status = "Accepted";
       order.pharmacyResponses[pharmacyResponseIndex].respondedAt = new Date();
 
-      const allAccepted = order.pharmacyResponses.every(
+      // Check if ANY pharmacy has accepted (for single pharmacy orders)
+      const anyAccepted = order.pharmacyResponses.some(
         (response) => response.status === "Accepted"
       );
 
-      if (allAccepted) {
+      if (anyAccepted) {
         order.pharmacyResponse = "Accepted";
         order.status = "Accepted";
+        
         order.statusTimeline.push({
           status: "Accepted",
           message: `Order accepted by pharmacy ${vendorId}`,
           timestamp: new Date(),
         });
 
-        // Assign nearest rider
+        // Assign nearest rider if not already assigned
         if (!order.assignedRider) {
           const riders = await Rider.find({ status: "online", drivingLicenseStatus: "Approved" });
           let nearestRider = null;
           let minDistance = Infinity;
 
-          // FIX: Handle case where userId may not have location (periodic/prescription)
           let userLat = order.userId?.location?.coordinates?.[1];
           let userLng = order.userId?.location?.coordinates?.[0];
-
-          // Fallback: try to get user location directly if not populated
-          if (!userLat || !userLng) {
-            const userDoc = await mongoose.model ? 
-              null : null; // will use riders[0] location as fallback below
-          }
 
           for (const rider of riders) {
             if (!rider.latitude || !rider.longitude) continue;
 
-            // Use pharmacy location as reference if user location unavailable
             const refLat = userLat || parseFloat(rider.latitude);
             const refLng = userLng || parseFloat(rider.longitude);
 
@@ -713,7 +736,7 @@ export const updateOrderStatusByVendor = async (req, res) => {
             order.assignedRiderStatus = "Assigned";
 
             const baseFare = nearestRider.baseFare || 30;
-            order.deliveryCharge = calculateDeliveryCharge(minDistance) + baseFare;
+            order.deliveryCharge = Math.round(calculateDeliveryCharge(minDistance) + baseFare);
 
             order.statusTimeline.push({
               status: "Rider Assigned",
@@ -730,13 +753,6 @@ export const updateOrderStatusByVendor = async (req, res) => {
             await nearestRider.save();
           }
         }
-      } else {
-        order.pharmacyResponse = "Pending";
-        order.statusTimeline.push({
-          status: "Pending",
-          message: `Pharmacy ${vendorId} accepted the order`,
-          timestamp: new Date(),
-        });
       }
 
       await order.save();
@@ -771,25 +787,60 @@ export const updateOrderStatusByVendor = async (req, res) => {
 };
 
 // =============================
-// REASSIGN ORDER AFTER 30s
+// REASSIGN ORDER AFTER 30s - FIXED VERSION
 // =============================
 const scheduleReassignOrder = async (orderId) => {
   setTimeout(async () => {
     try {
-      const order = await Order.findById(orderId);
-      if (!order) return;
+      console.log(`🔄 Attempting to reassign order ${orderId}...`);
+      
+      const order = await Order.findById(orderId).populate('orderItems.medicineId');
+      if (!order) {
+        console.log(`❌ Order ${orderId} not found`);
+        return;
+      }
 
-      if (order.status === "Accepted" || order.status === "Cancelled") return;
+      // Check if order is already accepted or cancelled
+      if (order.status === "Accepted" || order.status === "Cancelled" || order.status === "Delivered") {
+        console.log(`✅ Order ${orderId} already ${order.status}, no reassignment needed`);
+        return;
+      }
 
       const rejectedPharmacies = order.rejectedPharmacies || [];
-
-      // Next available vendor
-      const nextPharmacy = await Pharmacy.findOne({
-        _id: { $nin: rejectedPharmacies },
-        status: "active",
-      });
-
-      if (!nextPharmacy) {
+      
+      // Get all medicines in the order to find their pharmacies
+      const medicineIds = order.orderItems.map(item => item.medicineId?._id).filter(id => id);
+      
+      let availablePharmacies = [];
+      
+      if (medicineIds.length > 0) {
+        // Find pharmacies that have these medicines
+        const pharmaciesWithMedicines = await Pharmacy.find({
+          _id: { $nin: rejectedPharmacies },
+          status: "Active",
+          products: { $in: medicineIds }
+        }).select('_id name location latitude longitude');
+        
+        availablePharmacies = pharmaciesWithMedicines;
+      }
+      
+      // If no pharmacies found with specific medicines, find any active pharmacy
+      if (availablePharmacies.length === 0) {
+        const activePharmacies = await Pharmacy.find({
+          _id: { $nin: rejectedPharmacies },
+          status: "Active"
+        }).select('_id name location latitude longitude');
+        
+        availablePharmacies = activePharmacies;
+      }
+      
+      // Remove already rejected pharmacies
+      availablePharmacies = availablePharmacies.filter(
+        pharmacy => !rejectedPharmacies.includes(pharmacy._id.toString())
+      );
+      
+      if (availablePharmacies.length === 0) {
+        console.log(`❌ No available pharmacies for order ${orderId}`);
         order.status = "Cancelled";
         order.statusTimeline.push({
           status: "Cancelled",
@@ -799,27 +850,71 @@ const scheduleReassignOrder = async (orderId) => {
         await order.save();
         return;
       }
-
-      // Assign new pharmacy
+      
+      // Sort pharmacies by distance to user (if user location exists)
+      let userLat = order.userId?.location?.coordinates?.[1];
+      let userLng = order.userId?.location?.coordinates?.[0];
+      
+      if (userLat && userLng) {
+        availablePharmacies.sort((a, b) => {
+          const distA = calculateDistance(
+            [a.longitude || 0, a.latitude || 0],
+            [userLng, userLat]
+          );
+          const distB = calculateDistance(
+            [b.longitude || 0, b.latitude || 0],
+            [userLng, userLat]
+          );
+          return distA - distB;
+        });
+      }
+      
+      // Get the next available pharmacy
+      const nextPharmacy = availablePharmacies[0];
+      
+      console.log(`🔄 Reassigning order ${orderId} to pharmacy ${nextPharmacy._id}`);
+      
+      // Add new pharmacy response
       order.pharmacyResponses.push({
         pharmacyId: nextPharmacy._id,
         status: "Pending",
         respondedAt: null,
       });
+      
+      // Update order assignment
+      order.assignedPharmacy = nextPharmacy._id;
+      order.vendorId = nextPharmacy._id;
+      order.pharmacyId = nextPharmacy._id;
+      
       order.statusTimeline.push({
         status: "Reassigned",
-        message: `Order reassigned to pharmacy ${nextPharmacy._id}`,
+        message: `Order reassigned to pharmacy ${nextPharmacy.name || nextPharmacy._id}`,
         timestamp: new Date(),
       });
-
+      
       await order.save();
-
+      
+      // Send notification to the new pharmacy
+      const pharmacy = await Pharmacy.findById(nextPharmacy._id);
+      if (pharmacy) {
+        if (!pharmacy.notifications) pharmacy.notifications = [];
+        pharmacy.notifications.push({
+          message: `New order #${order._id.toString().slice(-6)} assigned to you`,
+          orderId: order._id,
+          type: "new_order",
+          timestamp: new Date(),
+          read: false,
+        });
+        await pharmacy.save();
+      }
+      
+      console.log(`✅ Order ${orderId} successfully reassigned to ${nextPharmacy._id}`);
+      
     } catch (err) {
       console.error("Error in reassignment:", err);
     }
-  }, 30 * 1000);
+  }, 30 * 1000); // 30 seconds delay
 };
-
 
 
 // Utility functions
@@ -1856,21 +1951,88 @@ export const createOrderFromPrescription = async (req, res) => {
       country: addr.country || "India",
     };
 
-    // ── build order items & subtotal ──────────────────────────────────────────
+    // ── get delivery charge configuration from any rider (admin configured) ──
+    const anyRider = await Rider.findOne().select("baseFare baseDistanceKm additionalChargePerKm");
+    
+    const baseFare = anyRider?.baseFare || 30;
+    const baseDistanceKm = anyRider?.baseDistanceKm || 2;
+    const additionalChargePerKm = anyRider?.additionalChargePerKm || 10;
+
+    // ── calculate distance between pharmacy and user ─────────────────────────
+    const pharmacyLat = parseFloat(pharmacy.latitude);
+    const pharmacyLng = parseFloat(pharmacy.longitude);
+    const userLat = user.location?.coordinates?.[1];
+    const userLng = user.location?.coordinates?.[0];
+
+    let deliveryCharge = baseFare;
+    let distanceKm = 0;
+    let extraDistanceKm = 0;
+    let additionalCharge = 0;
+
+    if (pharmacyLat && pharmacyLng && userLat && userLng) {
+      distanceKm = getDistanceInKm(pharmacyLat, pharmacyLng, userLat, userLng);
+      
+      if (distanceKm > baseDistanceKm) {
+        extraDistanceKm = distanceKm - baseDistanceKm;
+        additionalCharge = extraDistanceKm * additionalChargePerKm;
+        deliveryCharge = baseFare + additionalCharge;
+      }
+      
+      deliveryCharge = Math.round(deliveryCharge);
+    }
+
+    // ── 🔴 FIX: Fetch medicine details from database to get actual price ─────
     let subTotal = 0;
-    const orderItems = medicineDetails.map(item => {
-      const price    = Number(item.price) || 0;
+    const orderItems = [];
+
+    for (const item of medicineDetails) {
+      // Fetch medicine from database to get the real price
+      let medicinePrice = 0;
+      let medicineData = null;
+      
+      if (item.medicineId && mongoose.Types.ObjectId.isValid(item.medicineId)) {
+        medicineData = await Medicine.findById(item.medicineId).select('mrp price name images');
+        if (medicineData) {
+          // Use mrp or price field (whichever exists)
+          medicinePrice = medicineData.mrp || medicineData.price || 0;
+        }
+      }
+      
+      // If medicine not found or price not available, use the provided price or default to 0
+      if (medicinePrice === 0 && item.price) {
+        medicinePrice = Number(item.price) || 0;
+      }
+      
       const quantity = Number(item.quantity) || 1;
-      subTotal += price * quantity;
-      const entry = { medicineId: item.medicineId, name: item.name, quantity, price };
-      if (item.dosage)        entry.dosage        = item.dosage;
-      if (item.instructions)  entry.instructions  = item.instructions;
-      return entry;
-    });
+      const totalPrice = medicinePrice * quantity;
+      subTotal += totalPrice;
+      
+      const orderItem = { 
+        medicineId: item.medicineId, 
+        name: item.name || (medicineData?.name) || "Unknown Medicine",
+        quantity, 
+        price: medicinePrice,  // ✅ Use actual price from database
+        images: item.images || (medicineData?.images) || []
+      };
+      
+      if (item.dosage)        orderItem.dosage        = item.dosage;
+      if (item.instructions)  orderItem.instructions  = item.instructions;
+      
+      orderItems.push(orderItem);
+    }
 
     const platformFee    = 10;
-    const deliveryCharge = 40;
     const totalAmount    = subTotal + platformFee + deliveryCharge;
+
+    // ── delivery charge breakdown ─────────────────────────────────────────────
+    const deliveryChargeBreakdown = {
+      baseFare,
+      baseDistanceKm,
+      additionalChargePerKm,
+      distanceKm: Number(distanceKm.toFixed(2)),
+      extraDistanceKm: Number(extraDistanceKm.toFixed(2)),
+      additionalCharge: Number(additionalCharge.toFixed(2))
+    };
 
     // ── build preview object ──────────────────────────────────────────────────
     const orderPreview = {
@@ -1886,6 +2048,7 @@ export const createOrderFromPrescription = async (req, res) => {
       subTotal,
       platformFee,
       deliveryCharge,
+      deliveryChargeBreakdown,
       totalAmount,
       notes:           notes          || "",
       paymentMethod:   paymentMethod  || "Cash on Delivery",
@@ -1904,7 +2067,7 @@ export const createOrderFromPrescription = async (req, res) => {
 
     // Add the new notification with ALL required fields
     user.notifications.push({
-      type: "prescription_order_preview",  // ✅ IMPORTANT: This must be set
+      type: "prescription_order_preview",
       status: "Pending",
       message: `${pharmacy.name} has reviewed your prescription and prepared an order. Please review and confirm.`,
       timestamp: new Date(),
@@ -1912,7 +2075,7 @@ export const createOrderFromPrescription = async (req, res) => {
       orderPreview: orderPreview,
       prescriptionId: prescriptionId,
       vendorId: vendorId,
-      orderId: null  // Explicitly set to null for preview
+      orderId: null
     });
 
     await user.save();
@@ -1920,8 +2083,6 @@ export const createOrderFromPrescription = async (req, res) => {
     // ── update prescription status ────────────────────────────────────────────
     prescription.status = "Pending User Confirmation";
     await prescription.save();
-
-    console.log("✅ Order preview sent to user. Notification saved:", JSON.stringify(user.notifications[user.notifications.length - 1], null, 2));
 
     return res.status(200).json({
       message: "Order preview sent to user for confirmation",
@@ -1932,6 +2093,32 @@ export const createOrderFromPrescription = async (req, res) => {
     console.error("createOrderFromPrescription error:", error);
     return res.status(500).json({ message: "Server Error", error: error.message });
   }
+};
+
+// Add this helper function at the top of VendorController.js (after imports)
+
+// Distance calculator - Haversine formula
+const getDistanceInKm = (lat1, lon1, lat2, lon2) => {
+  // Validate inputs
+  if (isNaN(lat1) || isNaN(lon1) || isNaN(lat2) || isNaN(lon2)) {
+    console.error("Invalid coordinates:", { lat1, lon1, lat2, lon2 });
+    return 0;
+  }
+  
+  const toRad = (value) => (value * Math.PI) / 180;
+  const R = 6371; // Earth radius in km
+  
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * 
+            Math.sin(dLon / 2) ** 2;
+  
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const distance = R * c;
+  
+  return distance;
 };
 
 // Update Prescription Status

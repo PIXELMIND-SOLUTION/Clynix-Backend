@@ -564,6 +564,179 @@ const formatTimeTo12Hour = (date) => {
 // };
 
 
+// export const getNewOrdersForRiderController = async (req, res) => {
+//   try {
+//     const { riderId } = req.params;
+
+//     if (!mongoose.Types.ObjectId.isValid(riderId)) {
+//       return res.status(400).json({ success: false, message: "Invalid rider ID" });
+//     }
+
+//     const rider = await Rider.findById(riderId);
+//     if (!rider) {
+//       return res.status(404).json({ success: false, message: "Rider not found" });
+//     }
+
+//     const newOrders = await Order.find({
+//       assignedRider: riderId,
+//       assignedRiderStatus: "Assigned",
+//     })
+//       .populate({
+//         path: "orderItems.medicineId",
+//         model: "Medicine",
+//         select: "name mrp description images pharmacyId",
+//         populate: {
+//           path: "pharmacyId",
+//           model: "Pharmacy",
+//           select: "name address vendorPhone latitude longitude image",
+//         },
+//       })
+//       .populate({ path: "userId", model: "User", select: "name mobile location" })
+//       .lean();
+
+//     if (!newOrders.length) {
+//       return res.status(200).json({ success: true, message: "No new orders assigned to you", newOrders: [] });
+//     }
+
+//     const calculateDistance = (point1, point2) => {
+//       const [lon1, lat1] = point1;
+//       const [lon2, lat2] = point2;
+//       const R = 6371;
+//       const dLat = ((lat2 - lat1) * Math.PI) / 180;
+//       const dLon = ((lon2 - lon1) * Math.PI) / 180;
+//       const a =
+//         Math.sin(dLat / 2) ** 2 +
+//         Math.cos((lat1 * Math.PI) / 180) *
+//         Math.cos((lat2 * Math.PI) / 180) *
+//         Math.sin(dLon / 2) ** 2;
+//       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+//       return R * c;
+//     };
+
+//     const updatedOrders = newOrders.map(order => {
+//       // ✅ IMPORTANT: Use the order's stored delivery charge
+//       // This is the key fix - estimatedEarning should be the order's deliveryCharge
+//       const estimatedEarning = order.deliveryCharge || 0;
+      
+//       console.log(`Order ${order._id} - Stored deliveryCharge: ${estimatedEarning}`);
+
+//       if (!order.orderItems?.length) return null;
+
+//       const user = order.userId;
+//       if (!user?.location?.coordinates) return null;
+//       const userLocation = user.location.coordinates;
+
+//       const riderLat = parseFloat(rider.latitude);
+//       const riderLon = parseFloat(rider.longitude);
+
+//       const firstPharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
+//       if (!firstPharmacy) return null;
+
+//       const pharmacyLat = parseFloat(firstPharmacy.latitude);
+//       const pharmacyLon = parseFloat(firstPharmacy.longitude);
+//       const userLat = userLocation[1];
+//       const userLon = userLocation[0];
+
+//       const distanceToPharmacy = calculateDistance(
+//         [riderLon, riderLat],
+//         [pharmacyLon, pharmacyLat]
+//       );
+//       const distanceToUser = calculateDistance(
+//         [pharmacyLon, pharmacyLat],
+//         [userLon, userLat]
+//       );
+//       const totalDistance = distanceToPharmacy + distanceToUser;
+
+//       // Use the order's stored breakdown if available, otherwise create display breakdown
+//       const deliveryChargeBreakdown = order.deliveryChargeBreakdown || {
+//         baseFare: rider.baseFare || 30,
+//         baseDistanceKm: rider.baseDistanceKm || 2,
+//         additionalChargePerKm: rider.additionalChargePerKm || 10,
+//         totalDistanceKm: totalDistance,
+//         distanceToPharmacy: distanceToPharmacy,
+//         distanceToUser: distanceToUser,
+//         extraDistanceKm: Math.max(0, totalDistance - (rider.baseDistanceKm || 2)),
+//         additionalCharge: Math.max(0, (totalDistance - (rider.baseDistanceKm || 2)) * (rider.additionalChargePerKm || 10))
+//       };
+
+//       // Pharmacy pickups grouping
+//       const pharmacyPickupMap = {};
+//       const mappedOrderItems = order.orderItems.map(item => {
+//         const pharmacy = item.medicineId?.pharmacyId;
+//         if (!pharmacy) return null;
+
+//         const pharmacyId = pharmacy._id.toString();
+//         if (!pharmacyPickupMap[pharmacyId]) {
+//           pharmacyPickupMap[pharmacyId] = {
+//             pharmacyId,
+//             pharmacyName: pharmacy.name,
+//             pharmacyAddress: pharmacy.address,
+//             pharmacyPhone: pharmacy.vendorPhone,
+//             pharmacyLatitude: pharmacy.latitude,
+//             pharmacyLongitude: pharmacy.longitude,
+//             pharmacyImage: pharmacy.image || null,
+//             responseStatus: "Accepted",
+//             medicines: [],
+//             totalItems: 0,
+//             isPickupCompleted: false,
+//           };
+//         }
+
+//         pharmacyPickupMap[pharmacyId].medicines.push({
+//           medicineId: item.medicineId._id,
+//           name: item.medicineId.name,
+//           mrp: item.medicineId.mrp,
+//           quantity: item.quantity,
+//           images: item.medicineId.images || [],
+//           description: item.medicineId.description,
+//           isPicked: false,
+//         });
+
+//         pharmacyPickupMap[pharmacyId].totalItems += item.quantity;
+
+//         return {
+//           ...item,
+//           pharmacyDetails: {
+//             _id: pharmacy._id,
+//             name: pharmacy.name,
+//             address: pharmacy.address,
+//             image: pharmacy.image || null,
+//             latitude: parseFloat(pharmacy.latitude),
+//             longitude: parseFloat(pharmacy.longitude),
+//           },
+//           isPicked: false,
+//         };
+//       }).filter(Boolean);
+
+//       const pharmacyPickups = Object.values(pharmacyPickupMap);
+
+//       return {
+//         ...order,
+//         orderItems: mappedOrderItems,
+//         pharmacyPickups,
+//         estimatedEarning: estimatedEarning, // ✅ This will now be 4105, not 45
+//         deliveryChargeBreakdown,
+//         orderId: `ORD${order._id.toString().substring(0, 8).toUpperCase()}`,
+//         pharmacyResponses: undefined,
+//       };
+//     }).filter(Boolean);
+
+//     return res.status(200).json({
+//       success: true,
+//       message: "New orders fetched successfully",
+//       newOrders: updatedOrders,
+//     });
+
+//   } catch (error) {
+//     console.error("Error fetching orders:", error);
+//     return res.status(500).json({
+//       success: false,
+//       message: "Server error while fetching new orders",
+//       error: error.message,
+//     });
+//   }
+// };
+
 export const getNewOrdersForRiderController = async (req, res) => {
   try {
     const { riderId } = req.params;
@@ -614,11 +787,9 @@ export const getNewOrdersForRiderController = async (req, res) => {
     };
 
     const updatedOrders = newOrders.map(order => {
-      // ✅ IMPORTANT: Use the order's stored delivery charge
-      // This is the key fix - estimatedEarning should be the order's deliveryCharge
+      // ✅ ONLY CHANGE: For prescription orders, estimatedEarning is deliveryCharge only
+      // For non-prescription orders, keep original logic (deliveryCharge only as well based on your requirement)
       const estimatedEarning = order.deliveryCharge || 0;
-      
-      console.log(`Order ${order._id} - Stored deliveryCharge: ${estimatedEarning}`);
 
       if (!order.orderItems?.length) return null;
 
@@ -647,7 +818,6 @@ export const getNewOrdersForRiderController = async (req, res) => {
       );
       const totalDistance = distanceToPharmacy + distanceToUser;
 
-      // Use the order's stored breakdown if available, otherwise create display breakdown
       const deliveryChargeBreakdown = order.deliveryChargeBreakdown || {
         baseFare: rider.baseFare || 30,
         baseDistanceKm: rider.baseDistanceKm || 2,
@@ -659,7 +829,6 @@ export const getNewOrdersForRiderController = async (req, res) => {
         additionalCharge: Math.max(0, (totalDistance - (rider.baseDistanceKm || 2)) * (rider.additionalChargePerKm || 10))
       };
 
-      // Pharmacy pickups grouping
       const pharmacyPickupMap = {};
       const mappedOrderItems = order.orderItems.map(item => {
         const pharmacy = item.medicineId?.pharmacyId;
@@ -714,7 +883,7 @@ export const getNewOrdersForRiderController = async (req, res) => {
         ...order,
         orderItems: mappedOrderItems,
         pharmacyPickups,
-        estimatedEarning: estimatedEarning, // ✅ This will now be 4105, not 45
+        estimatedEarning: estimatedEarning,
         deliveryChargeBreakdown,
         orderId: `ORD${order._id.toString().substring(0, 8).toUpperCase()}`,
         pharmacyResponses: undefined,
@@ -1333,100 +1502,100 @@ export const getAcceptedOrdersForRiderController = async (req, res) => {
   }
 };
 
-export const getPickedUpOrdersForRiderController = async (req, res) => {
-  try {
-    const { riderId } = req.params;
+// export const getPickedUpOrdersForRiderController = async (req, res) => {
+//   try {
+//     const { riderId } = req.params;
 
-    if (!mongoose.Types.ObjectId.isValid(riderId)) {
-      return res.status(400).json({ message: "Invalid rider ID" });
-    }
+//     if (!mongoose.Types.ObjectId.isValid(riderId)) {
+//       return res.status(400).json({ message: "Invalid rider ID" });
+//     }
 
-    // ✅ Get rider first to have delivery charge
-    const rider = await Rider.findById(riderId);
-    if (!rider) {
-      return res.status(404).json({ message: "Rider not found" });
-    }
+//     // ✅ Get rider first to have delivery charge
+//     const rider = await Rider.findById(riderId);
+//     if (!rider) {
+//       return res.status(404).json({ message: "Rider not found" });
+//     }
 
-    const deliveryCharge = parseFloat(rider.deliveryCharge) || 0; // ✅ Get from rider
+//     const deliveryCharge = parseFloat(rider.deliveryCharge) || 0; // ✅ Get from rider
 
-    const pickedUpOrders = await Order.find({
-      assignedRider: riderId,
-      assignedRiderStatus: "PickedUp",
-    })
-      .populate({
-        path: "orderItems.medicineId",
-        select: "name mrp description images pharmacyId",
-        populate: {
-          path: "pharmacyId",
-          select: "name address contactNumber latitude longitude",
-        },
-      })
-      .populate({
-        path: "userId",
-        select: "name mobile location",
-      })
-      .lean();
+//     const pickedUpOrders = await Order.find({
+//       assignedRider: riderId,
+//       assignedRiderStatus: "PickedUp",
+//     })
+//       .populate({
+//         path: "orderItems.medicineId",
+//         select: "name mrp description images pharmacyId",
+//         populate: {
+//           path: "pharmacyId",
+//           select: "name address contactNumber latitude longitude",
+//         },
+//       })
+//       .populate({
+//         path: "userId",
+//         select: "name mobile location",
+//       })
+//       .lean();
 
-    if (!pickedUpOrders || pickedUpOrders.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "No picked up orders for you yet." });
-    }
+//     if (!pickedUpOrders || pickedUpOrders.length === 0) {
+//       return res
+//         .status(404)
+//         .json({ message: "No picked up orders for you yet." });
+//     }
 
-    const updatedOrders = pickedUpOrders.map((order) => {
-      const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
-      const userLocation = order.userId?.location?.coordinates;
+//     const updatedOrders = pickedUpOrders.map((order) => {
+//       const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
+//       const userLocation = order.userId?.location?.coordinates;
 
-      const pharmacyLat = parseFloat(pharmacy?.latitude);
-      const pharmacyLon = parseFloat(pharmacy?.longitude);
-      const userLat = userLocation?.[1];
-      const userLon = userLocation?.[0];
+//       const pharmacyLat = parseFloat(pharmacy?.latitude);
+//       const pharmacyLon = parseFloat(pharmacy?.longitude);
+//       const userLat = userLocation?.[1];
+//       const userLon = userLocation?.[0];
 
-      const dropDistance = calculateDistance(
-        [pharmacyLon, pharmacyLat],
-        [userLon, userLat]
-      );
+//       const dropDistance = calculateDistance(
+//         [pharmacyLon, pharmacyLat],
+//         [userLon, userLat]
+//       );
 
-      const dropMinutes = calculateTime(dropDistance);
-      const dropTimeEstimate = addMinutesToTime(order.createdAt, dropMinutes);
-      const formattedDropTime = formatTimeTo12Hour(dropTimeEstimate);
+//       const dropMinutes = calculateTime(dropDistance);
+//       const dropTimeEstimate = addMinutesToTime(order.createdAt, dropMinutes);
+//       const formattedDropTime = formatTimeTo12Hour(dropTimeEstimate);
 
-      const totalItems = order.orderItems.length;
-      let subTotal = 0;
+//       const totalItems = order.orderItems.length;
+//       let subTotal = 0;
 
-      order.orderItems.forEach((item) => {
-        const mrp = item?.medicineId?.mrp || 0;
-        const quantity = item?.quantity || 1;
-        subTotal += mrp * quantity;
-      });
+//       order.orderItems.forEach((item) => {
+//         const mrp = item?.medicineId?.mrp || 0;
+//         const quantity = item?.quantity || 1;
+//         subTotal += mrp * quantity;
+//       });
 
-      const platformFee = 10;
-      const totalPaid = subTotal + platformFee + deliveryCharge; // ✅ Use rider's delivery charge
+//       const platformFee = 10;
+//       const totalPaid = subTotal + platformFee + deliveryCharge; // ✅ Use rider's delivery charge
 
-      return {
-        order,
-        formattedDropDistance: dropDistance.toFixed(2),
-        dropTime: formattedDropTime,
-        deliveryCharge: deliveryCharge, // ✅ Include in main object
-        billingDetails: {
-          totalItems,
-          subTotal: `₹${subTotal.toFixed(2)}`,
-          platformFee: `₹${platformFee.toFixed(2)}`,
-          deliveryCharge: `₹${deliveryCharge.toFixed(2)}`, // ✅ Now shows correct value
-          totalPaid: `₹${totalPaid.toFixed(2)}`,
-        },
-        upiId: order.paymentMethod === "Cash on Delivery" ? (rider.upiId || "juleeperween@ybl") : null,
-      };
-    });
+//       return {
+//         order,
+//         formattedDropDistance: dropDistance.toFixed(2),
+//         dropTime: formattedDropTime,
+//         deliveryCharge: deliveryCharge, // ✅ Include in main object
+//         billingDetails: {
+//           totalItems,
+//           subTotal: `₹${subTotal.toFixed(2)}`,
+//           platformFee: `₹${platformFee.toFixed(2)}`,
+//           deliveryCharge: `₹${deliveryCharge.toFixed(2)}`, // ✅ Now shows correct value
+//           totalPaid: `₹${totalPaid.toFixed(2)}`,
+//         },
+//         upiId: order.paymentMethod === "Cash on Delivery" ? (rider.upiId || "juleeperween@ybl") : null,
+//       };
+//     });
 
-    return res.status(200).json({ pickedUpOrders: updatedOrders });
-  } catch (error) {
-    console.error("Error fetching picked up orders for rider:", error);
-    return res
-      .status(500)
-      .json({ message: "Server error while fetching picked up orders." });
-  }
-};
+//     return res.status(200).json({ pickedUpOrders: updatedOrders });
+//   } catch (error) {
+//     console.error("Error fetching picked up orders for rider:", error);
+//     return res
+//       .status(500)
+//       .json({ message: "Server error while fetching picked up orders." });
+//   }
+// };
 
 
 
@@ -1630,6 +1799,101 @@ export const getPickedUpOrdersForRiderController = async (req, res) => {
 
 
 // Add this helper function at the top of your file (after imports)
+
+export const getPickedUpOrdersForRiderController = async (req, res) => {
+  try {
+    const { riderId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(riderId)) {
+      return res.status(400).json({ message: "Invalid rider ID" });
+    }
+
+    const rider = await Rider.findById(riderId);
+    if (!rider) {
+      return res.status(404).json({ message: "Rider not found" });
+    }
+
+    const deliveryCharge = parseFloat(rider.deliveryCharge) || 0;
+
+    const pickedUpOrders = await Order.find({
+      assignedRider: riderId,
+      assignedRiderStatus: "PickedUp",
+    })
+      .populate({
+        path: "orderItems.medicineId",
+        select: "name mrp description images pharmacyId",
+        populate: {
+          path: "pharmacyId",
+          select: "name address contactNumber latitude longitude",
+        },
+      })
+      .populate({
+        path: "userId",
+        select: "name mobile location",
+      })
+      .lean();
+
+    if (!pickedUpOrders || pickedUpOrders.length === 0) {
+      return res
+        .status(404)
+        .json({ message: "No picked up orders for you yet." });
+    }
+
+    const updatedOrders = pickedUpOrders.map((order) => {
+      const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
+      const userLocation = order.userId?.location?.coordinates;
+
+      const pharmacyLat = parseFloat(pharmacy?.latitude);
+      const pharmacyLon = parseFloat(pharmacy?.longitude);
+      const userLat = userLocation?.[1];
+      const userLon = userLocation?.[0];
+
+      const dropDistance = calculateDistance(
+        [pharmacyLon, pharmacyLat],
+        [userLon, userLat]
+      );
+
+      const dropMinutes = calculateTime(dropDistance);
+      const dropTimeEstimate = addMinutesToTime(order.createdAt, dropMinutes);
+      const formattedDropTime = formatTimeTo12Hour(dropTimeEstimate);
+
+      const totalItems = order.orderItems.length;
+      let subTotal = 0;
+
+      order.orderItems.forEach((item) => {
+        const mrp = item?.medicineId?.mrp || 0;
+        const quantity = item?.quantity || 1;
+        subTotal += mrp * quantity;
+      });
+
+      const platformFee = 10;
+      const totalPaid = subTotal + platformFee + deliveryCharge;
+
+      // ✅ Keep exactly the same response structure
+      return {
+        order,
+        formattedDropDistance: dropDistance.toFixed(2),
+        dropTime: formattedDropTime,
+        deliveryCharge: deliveryCharge,
+        billingDetails: {
+          totalItems,
+          subTotal: `₹${subTotal.toFixed(2)}`,
+          platformFee: `₹${platformFee.toFixed(2)}`,
+          deliveryCharge: `₹${deliveryCharge.toFixed(2)}`,
+          totalPaid: `₹${totalPaid.toFixed(2)}`,
+        },
+        upiId: order.paymentMethod === "Cash on Delivery" ? (rider.upiId || "juleeperween@ybl") : null,
+      };
+    });
+
+    return res.status(200).json({ pickedUpOrders: updatedOrders });
+  } catch (error) {
+    console.error("Error fetching picked up orders for rider:", error);
+    return res
+      .status(500)
+      .json({ message: "Server error while fetching picked up orders." });
+  }
+};
 // Add this helper function at the top of your file (after imports)
 const findNearestAvailableRider = async (order, excludedRiderId = null) => {
   try {
@@ -1966,26 +2230,121 @@ export const updateRiderStatusController = async (req, res) => {
 };
 
 
+// export const getSingleOrderForRiderController = async (req, res) => {
+//   try {
+//     const { riderId, orderId } = req.params;
+
+//     // Validate IDs
+//     if (!mongoose.Types.ObjectId.isValid(riderId) || !mongoose.Types.ObjectId.isValid(orderId)) {
+//       return res.status(400).json({ message: "Invalid rider ID or order ID" });
+//     }
+
+//     // Fetch order
+//     const order = await Order.findOne({
+//       _id: orderId,
+//       assignedRider: riderId,
+//     })
+//       .populate({
+//         path: 'orderItems.medicineId',
+//         select: 'name mrp description images pharmacyId',  // Add more fields as needed
+//         populate: {
+//           path: 'pharmacyId',
+//           select: 'name address contactNumber latitude longitude' // Full pharmacy details
+//         }
+//       })
+//       .populate({
+//         path: 'userId',
+//         select: 'name mobile location'
+//       })
+//       .lean();
+
+//     if (!order) {
+//       return res.status(404).json({ message: 'Order not found or not assigned to rider' });
+//     }
+
+//     // Fetch rider
+//     const rider = await Rider.findById(riderId);
+//     if (!rider) {
+//       return res.status(404).json({ message: "Rider not found" });
+//     }
+
+//     const riderLat = parseFloat(rider.latitude);
+//     const riderLon = parseFloat(rider.longitude);
+//     const deliveryCharge = parseFloat(rider.deliveryCharge) || 0;
+
+//     const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
+//     const userLocation = order.userId?.location?.coordinates;
+
+//     if (!pharmacy || !userLocation) {
+//       return res.status(400).json({ message: "Invalid pharmacy or user location" });
+//     }
+
+//     // Distance calculations
+//     const pickupDistance = calculateDistance([riderLon, riderLat], [pharmacy.longitude, pharmacy.latitude]);
+//     const dropDistance = calculateDistance([pharmacy.longitude, pharmacy.latitude], [userLocation[0], userLocation[1]]);
+
+//     // Time estimations
+//     const pickupMinutes = calculateTime(pickupDistance);
+//     const dropMinutes = calculateTime(dropDistance);
+//     const pickupTime = addMinutesToTime(order.createdAt, pickupMinutes);
+//     const dropTime = addMinutesToTime(order.createdAt, pickupMinutes + dropMinutes);
+//     const formattedPickupTime = formatTimeTo12Hour(pickupTime);
+//     const formattedDropTime = formatTimeTo12Hour(dropTime);
+
+//     // Billing calculations
+//     const totalItems = order.orderItems.length;
+//     let subTotal = 0;
+
+//     order.orderItems.forEach(item => {
+//       const mrp = item?.medicineId?.mrp || 0;
+//       const quantity = item?.quantity || 1;
+//       subTotal += mrp * quantity;
+//     });
+
+//     const platformFee = 10; // Static
+//     const estimatedEarning = deliveryCharge;
+//     const totalPaid = subTotal + platformFee + deliveryCharge;
+
+//     return res.status(200).json({
+//       order,
+//       pickupDistance: `${pickupDistance.toFixed(2)} km`,
+//       dropDistance: `${dropDistance.toFixed(2)} km`,
+//       pickupTime: formattedPickupTime,
+//       dropTime: formattedDropTime,
+//       estimatedEarning: `₹${estimatedEarning.toFixed(2)}`,
+//       billingDetails: {
+//         totalItems,
+//         subTotal: `₹${subTotal.toFixed(2)}`,
+//         platformFee: `₹${platformFee.toFixed(2)}`,
+//         deliveryCharge: `₹${deliveryCharge.toFixed(2)}`,
+//         totalPaid: `₹${totalPaid.toFixed(2)}`
+//       }
+//     });
+
+//   } catch (error) {
+//     console.error("Error fetching single order for rider:", error);
+//     res.status(500).json({ message: "Server error while fetching order" });
+//   }
+// };
+
 export const getSingleOrderForRiderController = async (req, res) => {
   try {
     const { riderId, orderId } = req.params;
 
-    // Validate IDs
     if (!mongoose.Types.ObjectId.isValid(riderId) || !mongoose.Types.ObjectId.isValid(orderId)) {
       return res.status(400).json({ message: "Invalid rider ID or order ID" });
     }
 
-    // Fetch order
     const order = await Order.findOne({
       _id: orderId,
       assignedRider: riderId,
     })
       .populate({
         path: 'orderItems.medicineId',
-        select: 'name mrp description images pharmacyId',  // Add more fields as needed
+        select: 'name mrp description images pharmacyId',
         populate: {
           path: 'pharmacyId',
-          select: 'name address contactNumber latitude longitude' // Full pharmacy details
+          select: 'name address contactNumber latitude longitude'
         }
       })
       .populate({
@@ -1998,7 +2357,6 @@ export const getSingleOrderForRiderController = async (req, res) => {
       return res.status(404).json({ message: 'Order not found or not assigned to rider' });
     }
 
-    // Fetch rider
     const rider = await Rider.findById(riderId);
     if (!rider) {
       return res.status(404).json({ message: "Rider not found" });
@@ -2015,11 +2373,9 @@ export const getSingleOrderForRiderController = async (req, res) => {
       return res.status(400).json({ message: "Invalid pharmacy or user location" });
     }
 
-    // Distance calculations
     const pickupDistance = calculateDistance([riderLon, riderLat], [pharmacy.longitude, pharmacy.latitude]);
     const dropDistance = calculateDistance([pharmacy.longitude, pharmacy.latitude], [userLocation[0], userLocation[1]]);
 
-    // Time estimations
     const pickupMinutes = calculateTime(pickupDistance);
     const dropMinutes = calculateTime(dropDistance);
     const pickupTime = addMinutesToTime(order.createdAt, pickupMinutes);
@@ -2027,7 +2383,6 @@ export const getSingleOrderForRiderController = async (req, res) => {
     const formattedPickupTime = formatTimeTo12Hour(pickupTime);
     const formattedDropTime = formatTimeTo12Hour(dropTime);
 
-    // Billing calculations
     const totalItems = order.orderItems.length;
     let subTotal = 0;
 
@@ -2037,8 +2392,7 @@ export const getSingleOrderForRiderController = async (req, res) => {
       subTotal += mrp * quantity;
     });
 
-    const platformFee = 10; // Static
-    const estimatedEarning = deliveryCharge;
+    const platformFee = 10;
     const totalPaid = subTotal + platformFee + deliveryCharge;
 
     return res.status(200).json({
@@ -2047,7 +2401,7 @@ export const getSingleOrderForRiderController = async (req, res) => {
       dropDistance: `${dropDistance.toFixed(2)} km`,
       pickupTime: formattedPickupTime,
       dropTime: formattedDropTime,
-      estimatedEarning: `₹${estimatedEarning.toFixed(2)}`,
+      estimatedEarning: `₹${deliveryCharge.toFixed(2)}`,
       billingDetails: {
         totalItems,
         subTotal: `₹${subTotal.toFixed(2)}`,
@@ -2061,18 +2415,120 @@ export const getSingleOrderForRiderController = async (req, res) => {
     console.error("Error fetching single order for rider:", error);
     res.status(500).json({ message: "Server error while fetching order" });
   }
-};
+}; 
+
+
+// export const getAllActiveOrdersForRiderController = async (req, res) => {
+//   try {
+//     const { riderId } = req.params;
+
+//     // Validate riderId
+//     if (!mongoose.Types.ObjectId.isValid(riderId)) {
+//       return res.status(400).json({ message: "Invalid rider ID" });
+//     }
+
+//     // Fetch all active orders for rider
+//     const activeOrders = await Order.find({
+//       assignedRider: riderId,
+//       assignedRiderStatus: 'Accepted'
+//     })
+//       .populate({
+//         path: 'orderItems.medicineId',
+//         select: 'name mrp description images pharmacyId',
+//         populate: {
+//           path: 'pharmacyId',
+//           select: 'name address contactNumber latitude longitude'
+//         }
+//       })
+//       .populate({
+//         path: 'userId',
+//         select: 'name mobile location'
+//       })
+//       .lean();
+
+//     if (!activeOrders || activeOrders.length === 0) {
+//       return res.status(404).json({ message: 'No active orders found' });
+//     }
+
+//     // Get rider location and delivery charge
+//     const rider = await Rider.findById(riderId);
+//     if (!rider) {
+//       return res.status(404).json({ message: 'Rider not found' });
+//     }
+
+//     const riderLat = parseFloat(rider.latitude);
+//     const riderLon = parseFloat(rider.longitude);
+//     const deliveryCharge = parseFloat(rider.deliveryCharge) || 0; // ✅ Get from rider model
+
+//     console.log("Rider delivery charge:", deliveryCharge); // Debug log
+
+//     // Process each active order
+//     const updatedOrders = activeOrders.map(order => {
+//       const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
+//       const userLocation = order.userId?.location?.coordinates;
+
+//       if (!pharmacy || !userLocation) return order;
+
+//       const pharmacyLat = parseFloat(pharmacy?.latitude);
+//       const pharmacyLon = parseFloat(pharmacy?.longitude);
+//       const userLat = userLocation?.[1];
+//       const userLon = userLocation?.[0];
+
+//       // Distance and time calculations
+//       const pickupDistance = calculateDistance([riderLon, riderLat], [pharmacyLon, pharmacyLat]);
+//       const dropDistance = calculateDistance([pharmacyLon, pharmacyLat], [userLon, userLat]);
+
+//       const pickupMinutes = calculateTime(pickupDistance);
+//       const dropMinutes = calculateTime(dropDistance);
+
+//       const pickupTime = addMinutesToTime(order.createdAt, pickupMinutes);
+//       const dropTime = addMinutesToTime(order.createdAt, pickupMinutes + dropMinutes);
+
+//       // Billing calculations
+//       const totalItems = order.orderItems.length;
+//       let subTotal = 0;
+
+//       order.orderItems.forEach(item => {
+//         const mrp = item?.medicineId?.mrp || 0;
+//         const quantity = item?.quantity || 1;
+//         subTotal += mrp * quantity;
+//       });
+
+//       const platformFee = 10; // Static platform fee
+//       const totalPaid = subTotal + platformFee + deliveryCharge; // ✅ Use rider's delivery charge
+
+//       return {
+//         ...order,
+//         formattedPickupDistance: `${pickupDistance.toFixed(2)} km`,
+//         formattedDropDistance: `${dropDistance.toFixed(2)} km`,
+//         pickupTime: formatTimeTo12Hour(pickupTime),
+//         dropTime: formatTimeTo12Hour(dropTime),
+//         deliveryCharge: deliveryCharge, // ✅ Include delivery charge in main object
+//         billingDetails: {
+//           totalItems,
+//           subTotal: `₹${subTotal.toFixed(2)}`,
+//           platformFee: `₹${platformFee.toFixed(2)}`,
+//           deliveryCharge: `₹${deliveryCharge.toFixed(2)}`, // ✅ Now uses rider's delivery charge
+//           totalPaid: `₹${totalPaid.toFixed(2)}`
+//         }
+//       };
+//     });
+
+//     return res.status(200).json({ activeOrders: updatedOrders });
+//   } catch (error) {
+//     console.error("Error fetching active orders:", error);
+//     return res.status(500).json({ message: "Server error while fetching active orders" });
+//   }
+// };
 
 export const getAllActiveOrdersForRiderController = async (req, res) => {
   try {
     const { riderId } = req.params;
 
-    // Validate riderId
     if (!mongoose.Types.ObjectId.isValid(riderId)) {
       return res.status(400).json({ message: "Invalid rider ID" });
     }
 
-    // Fetch all active orders for rider
     const activeOrders = await Order.find({
       assignedRider: riderId,
       assignedRiderStatus: 'Accepted'
@@ -2095,7 +2551,6 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
       return res.status(404).json({ message: 'No active orders found' });
     }
 
-    // Get rider location and delivery charge
     const rider = await Rider.findById(riderId);
     if (!rider) {
       return res.status(404).json({ message: 'Rider not found' });
@@ -2103,11 +2558,8 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
 
     const riderLat = parseFloat(rider.latitude);
     const riderLon = parseFloat(rider.longitude);
-    const deliveryCharge = parseFloat(rider.deliveryCharge) || 0; // ✅ Get from rider model
+    const deliveryCharge = parseFloat(rider.deliveryCharge) || 0;
 
-    console.log("Rider delivery charge:", deliveryCharge); // Debug log
-
-    // Process each active order
     const updatedOrders = activeOrders.map(order => {
       const pharmacy = order.orderItems[0]?.medicineId?.pharmacyId;
       const userLocation = order.userId?.location?.coordinates;
@@ -2119,7 +2571,6 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
       const userLat = userLocation?.[1];
       const userLon = userLocation?.[0];
 
-      // Distance and time calculations
       const pickupDistance = calculateDistance([riderLon, riderLat], [pharmacyLon, pharmacyLat]);
       const dropDistance = calculateDistance([pharmacyLon, pharmacyLat], [userLon, userLat]);
 
@@ -2129,7 +2580,6 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
       const pickupTime = addMinutesToTime(order.createdAt, pickupMinutes);
       const dropTime = addMinutesToTime(order.createdAt, pickupMinutes + dropMinutes);
 
-      // Billing calculations
       const totalItems = order.orderItems.length;
       let subTotal = 0;
 
@@ -2139,8 +2589,8 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
         subTotal += mrp * quantity;
       });
 
-      const platformFee = 10; // Static platform fee
-      const totalPaid = subTotal + platformFee + deliveryCharge; // ✅ Use rider's delivery charge
+      const platformFee = 10;
+      const totalPaid = subTotal + platformFee + deliveryCharge;
 
       return {
         ...order,
@@ -2148,12 +2598,12 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
         formattedDropDistance: `${dropDistance.toFixed(2)} km`,
         pickupTime: formatTimeTo12Hour(pickupTime),
         dropTime: formatTimeTo12Hour(dropTime),
-        deliveryCharge: deliveryCharge, // ✅ Include delivery charge in main object
+        deliveryCharge: deliveryCharge,
         billingDetails: {
           totalItems,
           subTotal: `₹${subTotal.toFixed(2)}`,
           platformFee: `₹${platformFee.toFixed(2)}`,
-          deliveryCharge: `₹${deliveryCharge.toFixed(2)}`, // ✅ Now uses rider's delivery charge
+          deliveryCharge: `₹${deliveryCharge.toFixed(2)}`,
           totalPaid: `₹${totalPaid.toFixed(2)}`
         }
       };
@@ -2165,8 +2615,6 @@ export const getAllActiveOrdersForRiderController = async (req, res) => {
     return res.status(500).json({ message: "Server error while fetching active orders" });
   }
 };
-
-
 export const getAllCompletedOrdersForRiderController = async (req, res) => {
   try {
     const { riderId } = req.params;

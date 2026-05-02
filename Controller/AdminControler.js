@@ -582,9 +582,117 @@ export const getSingleOrder = async (req, res) => {
       return res.status(404).json({ message: "Order not found" });
     }
 
+    // Convert to object to modify
+    const orderObj = order.toObject();
+
+    // ✅ Format order items with proper price extraction
+    if (orderObj.orderItems && orderObj.orderItems.length > 0) {
+      orderObj.orderItems = orderObj.orderItems.map(item => ({
+        _id: item._id,
+        medicineId: item.medicineId?._id,
+        name: item.medicineId?.name || "Medicine not found",
+        price: item.medicineId?.price || 0,  // ✅ Extract price from populated medicine
+        quantity: item.quantity,
+        totalPrice: (item.medicineId?.price || 0) * (item.quantity || 0),
+        images: item.medicineId?.images || [],
+        description: item.medicineId?.description || "",
+        categoryName: item.medicineId?.categoryName || "",
+        pharmacy: item.medicineId?.pharmacyId ? {
+          id: item.medicineId.pharmacyId._id,
+          name: item.medicineId.pharmacyId.name,
+          location: item.medicineId.pharmacyId.location
+        } : null
+      }));
+    }
+
+    // Check if order is cancelled in timeline but might have pending reassignment
+    const isActuallyCancelled = orderObj.status === "Cancelled";
+    const hasReassignedInTimeline = orderObj.statusTimeline?.some(
+      timeline => timeline.status === "Reassigned"
+    );
+    
+    // If order is cancelled but has reassignment, it might be in process
+    if (isActuallyCancelled && hasReassignedInTimeline) {
+      // Check if there are any pending pharmacy responses
+      const hasPendingResponse = orderObj.pharmacyResponses?.some(
+        response => response.status === "Pending"
+      );
+      
+      // If there's a pending response, order is not really cancelled
+      if (hasPendingResponse) {
+        orderObj.status = "Pending";
+        orderObj.pharmacyResponse = "Pending";
+      }
+    }
+
+    // Check pharmacy responses status for pending orders
+    if (orderObj.status === "Pending" && orderObj.pharmacyResponses && orderObj.pharmacyResponses.length > 0) {
+      // Check if any pharmacy has accepted
+      const hasAccepted = orderObj.pharmacyResponses.some(
+        response => response.status === "Accepted"
+      );
+      
+      // Check if any pharmacy is still pending
+      const hasPending = orderObj.pharmacyResponses.some(
+        response => response.status === "Pending"
+      );
+      
+      // Check if all pharmacies have rejected
+      const allRejected = orderObj.pharmacyResponses.every(
+        response => response.status === "Rejected"
+      );
+
+      if (hasAccepted) {
+        // If any pharmacy accepted, show as Accepted
+        orderObj.status = "Accepted";
+      } else if (allRejected) {
+        // Only show Cancelled if ALL pharmacies rejected AND no pending reassignment
+        // Check if there are any other active pharmacies available in the system
+        const medicineIds = orderObj.orderItems.map(item => item.medicineId?._id).filter(id => id);
+        
+        let otherPharmaciesExist = false;
+        
+        if (medicineIds.length > 0) {
+          // Check if there are other active pharmacies with these medicines
+          const otherPharmacies = await Pharmacy.find({
+            _id: { $nin: orderObj.rejectedPharmacies || [] },
+            status: "Active",
+            products: { $in: medicineIds }
+          }).limit(1);
+          
+          otherPharmaciesExist = otherPharmacies.length > 0;
+        } else {
+          // Check if there are any other active pharmacies
+          const otherPharmacies = await Pharmacy.find({
+            _id: { $nin: orderObj.rejectedPharmacies || [] },
+            status: "Active"
+          }).limit(1);
+          
+          otherPharmaciesExist = otherPharmacies.length > 0;
+        }
+        
+        // Show Cancelled only if no other pharmacies available
+        if (!otherPharmaciesExist) {
+          orderObj.status = "Cancelled";
+        } else {
+          // Keep as Pending if reassignment is possible
+          orderObj.status = "Pending";
+        }
+      } else if (hasPending) {
+        // If some are pending, show as Pending
+        orderObj.status = "Pending";
+      }
+    }
+
+    // ✅ Also calculate subtotal and total if not present
+    if (!orderObj.subtotal && orderObj.orderItems) {
+      orderObj.subtotal = orderObj.orderItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    }
+
+    // Return with original structure, just status possibly modified
     return res.status(200).json({
       message: "Order fetched successfully",
-      order
+      order: orderObj
     });
 
   } catch (error) {
@@ -1428,14 +1536,246 @@ export const getRefundOrders = async (req, res) => {
 
 
 
+// export const getDashboardData = async (req, res) => {
+//   try {
+//     // Fetch all data in parallel
+//     const [users, pharmacies, orders, medicines, riders] = await Promise.all([
+//       User.find().lean(),
+//       Pharmacy.find().lean(),
+//       Order.find().lean(),
+//       Medicine.find().lean(),
+//       Rider.find().lean(),
+//     ]);
+
+//     // === Date Helpers ===
+//     const now = new Date();
+//     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+//     const daysAgo = (n) => {
+//       const d = new Date();
+//       d.setDate(d.getDate() - n);
+//       return d;
+//     };
+
+//     const monthsAgo = (n) => {
+//       const d = new Date();
+//       d.setMonth(d.getMonth() - n);
+//       return d;
+//     };
+
+//     // Count total orders (no filter)
+//     const totalOrders = orders.length;
+
+//     // Count today's orders using date-only comparison
+//     const isToday = (dateStr) => {
+//       const date = new Date(dateStr);
+//       return (
+//         date.getFullYear() === now.getFullYear() &&
+//         date.getMonth() === now.getMonth() &&
+//         date.getDate() === now.getDate()
+//       );
+//     };
+
+//     const todaysOrdersCount = orders.filter(
+//       (o) => o.createdAt && isToday(o.createdAt)
+//     ).length;
+
+//     // Count active pharmacies
+//     const activePharmaciesCount = pharmacies.filter(ph => ph.status === "Active").length;
+//     const inactivePharmaciesCount = pharmacies.filter(ph => ph.status === "Inactive").length;
+
+//     // === Revenue Data ===
+//     const revenueData = [
+//       {
+//         label: "Today",
+//         revenue: orders
+//           .filter(o => o.createdAt && new Date(o.createdAt) >= startOfToday)
+//           .reduce((sum, o) => sum + (o.totalAmount || 0), 0),
+//       },
+//       {
+//         label: "Last 7 Days",
+//         revenue: orders
+//           .filter(o => o.createdAt && new Date(o.createdAt) >= daysAgo(7))
+//           .reduce((sum, o) => sum + (o.totalAmount || 0), 0),
+//       },
+//       {
+//         label: "Last 1 Month",
+//         revenue: orders
+//           .filter(o => o.createdAt && new Date(o.createdAt) >= monthsAgo(1))
+//           .reduce((sum, o) => sum + (o.totalAmount || 0), 0),
+//       },
+//       {
+//         label: "Last 6 Months",
+//         revenue: orders
+//           .filter(o => o.createdAt && new Date(o.createdAt) >= monthsAgo(6))
+//           .reduce((sum, o) => sum + (o.totalAmount || 0), 0),
+//       },
+//       {
+//         label: "Last 12 Months",
+//         revenue: orders
+//           .filter(o => o.createdAt && new Date(o.createdAt) >= monthsAgo(12))
+//           .reduce((sum, o) => sum + (o.totalAmount || 0), 0),
+//       },
+//     ];
+
+//     // === Medicine to Pharmacy Mapping ===
+//     const medicineToPharmacyMap = new Map();
+//     medicines.forEach(med => {
+//       medicineToPharmacyMap.set(med._id.toString(), med.pharmacyId?.toString());
+//     });
+
+//     // === Pharmacy Revenue ===
+//     const pharmacyRevenueMap = new Map();
+
+//     orders.forEach(order => {
+//       if (!order.totalAmount || !order.orderItems || order.orderItems.length === 0) return;
+
+//       const perMedicineRevenue = order.totalAmount / order.orderItems.length;
+
+//       order.orderItems.forEach(item => {
+//         const medId = item.medicineId?.toString();
+//         const pharmacyId = medicineToPharmacyMap.get(medId);
+//         if (!pharmacyId) return;
+
+//         const currentRevenue = pharmacyRevenueMap.get(pharmacyId) || 0;
+//         pharmacyRevenueMap.set(pharmacyId, currentRevenue + perMedicineRevenue);
+//       });
+//     });
+
+//     // === Top Pharmacies ===
+//     const topPharmacies = pharmacies.map(ph => {
+//       const revenue = pharmacyRevenueMap.get(ph._id.toString()) || 0;
+
+//       const ordersCount = orders.filter(order =>
+//         order.orderItems.some(item =>
+//           medicineToPharmacyMap.get(item.medicineId?.toString()) === ph._id.toString()
+//         )
+//       ).length;
+
+//       return {
+//         name: ph.name,
+//         revenue,
+//         orders: ordersCount,
+//       };
+//     }).sort((a, b) => b.revenue - a.revenue);
+
+//     // === User Orders Summary ===
+//     const userOrdersMap = new Map();
+//     orders.forEach(order => {
+//       const userId = order.userId?.toString();
+//       if (!userId) return;
+//       if (!userOrdersMap.has(userId)) userOrdersMap.set(userId, []);
+//       userOrdersMap.get(userId).push(order);
+//     });
+
+//     const userOrdersSummary = users.map(user => {
+//       const userId = user._id.toString();
+//       const userOrders = userOrdersMap.get(userId) || [];
+
+//       const totalOrders = userOrders.length;
+//       const medicinesOrdered = userOrders.reduce((sum, order) =>
+//         sum + (order.orderItems?.length || 0), 0
+//       );
+
+//       const lastOrderDate = userOrders.reduce((latest, order) => {
+//         const orderDate = order.createdAt ? new Date(order.createdAt) : null;
+//         return orderDate && (!latest || orderDate > latest) ? orderDate : latest;
+//       }, null);
+
+//       let onTime = 0, delayed = 0, cancelled = 0;
+//       userOrders.forEach(order => {
+//         if (order.status === "cancelled") {
+//           cancelled++;
+//         } else if (order.status === "delivered") {
+//           if (order.isDelayed) delayed++;
+//           else onTime++;
+//         }
+//       });
+
+//       return {
+//         user: user.name || user.email || "Unknown",
+//         lastOrder: lastOrderDate ? lastOrderDate.toISOString().split('T')[0] : "No Orders",
+//         accountCreated: user.createdAt ? new Date(user.createdAt).toISOString().split('T')[0] : "Unknown",
+//         totalOrders,
+//         medicinesOrdered,
+//         onTime,
+//         delayed,
+//         cancelled,
+//       };
+//     });
+
+//     // === Pharmacy Insights ===
+//     const pharmacyInsights = pharmacies.map(ph => {
+//       const phId = ph._id.toString();
+
+//       const totalOrders = orders.filter(order =>
+//         order.orderItems.some(item =>
+//           medicineToPharmacyMap.get(item.medicineId?.toString()) === phId
+//         )
+//       ).length;
+
+//       let avgRating = 0;
+//       if (ph.ratings?.length > 0) {
+//         const sumRatings = ph.ratings.reduce((a, b) => a + b, 0);
+//         avgRating = sumRatings / ph.ratings.length;
+//       } else if (typeof ph.rating === "number") {
+//         avgRating = ph.rating;
+//       }
+
+//       const medicinesAvailable = medicines.filter(med => med.pharmacyId?.toString() === phId).length;
+//       const joinedDate = ph.createdAt ? new Date(ph.createdAt).toISOString().split("T")[0] : "Unknown";
+
+//       return {
+//         pharmacy: ph.name,
+//         totalOrders,
+//         avgRating: Number(avgRating.toFixed(2)),
+//         medicinesAvailable,
+//         joinedDate,
+//       };
+//     });
+
+//     // === Online Riders ===
+//     const onlineRidersCount = riders.filter(rider => rider.status === "online").length;
+
+//     // === Final Response ===
+//     res.json({
+//       stats: {
+//         totalUsers: users.length,
+//         totalOrders,                      // ✅ FIXED
+//         totalPharmacies: pharmacies.length,
+//         totalMedicines: medicines.length,
+//         totalRiders: riders.length,
+//         onlineRiders: onlineRidersCount,
+//         activePharmacies: activePharmaciesCount,
+//         inactivePharmacies: inactivePharmaciesCount,
+//         todaysOrders: todaysOrdersCount, // ✅ FIXED
+//       },
+//       revenueData,
+//       topPharmacies,
+//       userOrdersSummary,
+//       pharmacyInsights,
+//     });
+
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).json({
+//       message: "Failed to fetch dashboard data",
+//       error: error.message,
+//     });
+//   }
+// };
+
+
+// ✅ Create Banner Controller
+
 export const getDashboardData = async (req, res) => {
   try {
-    // Fetch all data in parallel
+    // Fetch all data in parallel with proper filtering
     const [users, pharmacies, orders, medicines, riders] = await Promise.all([
       User.find().lean(),
       Pharmacy.find().lean(),
       Order.find().lean(),
-      Medicine.find().lean(),
+      Medicine.find().populate('pharmacyId').lean(), // Populate to check pharmacy status
       Rider.find().lean(),
     ]);
 
@@ -1476,6 +1816,26 @@ export const getDashboardData = async (req, res) => {
     const activePharmaciesCount = pharmacies.filter(ph => ph.status === "Active").length;
     const inactivePharmaciesCount = pharmacies.filter(ph => ph.status === "Inactive").length;
 
+    // ✅ FIXED: Count only medicines from ACTIVE pharmacies
+    const activePharmacyIds = pharmacies
+      .filter(ph => ph.status === "Active")
+      .map(ph => ph._id.toString());
+    
+    const totalMedicines = medicines.filter(med => {
+      const pharmacyId = med.pharmacyId?._id?.toString() || med.pharmacyId?.toString();
+      return activePharmacyIds.includes(pharmacyId);
+    }).length;
+
+    // Count medicines from inactive pharmacies (for reference)
+    const inactivePharmacyIds = pharmacies
+      .filter(ph => ph.status === "Inactive")
+      .map(ph => ph._id.toString());
+    
+    const inactiveMedicinesCount = medicines.filter(med => {
+      const pharmacyId = med.pharmacyId?._id?.toString() || med.pharmacyId?.toString();
+      return inactivePharmacyIds.includes(pharmacyId);
+    }).length;
+
     // === Revenue Data ===
     const revenueData = [
       {
@@ -1510,10 +1870,13 @@ export const getDashboardData = async (req, res) => {
       },
     ];
 
-    // === Medicine to Pharmacy Mapping ===
+    // === Medicine to Pharmacy Mapping (only active pharmacies) ===
     const medicineToPharmacyMap = new Map();
     medicines.forEach(med => {
-      medicineToPharmacyMap.set(med._id.toString(), med.pharmacyId?.toString());
+      const pharmacyId = med.pharmacyId?._id?.toString() || med.pharmacyId?.toString();
+      if (activePharmacyIds.includes(pharmacyId)) {
+        medicineToPharmacyMap.set(med._id.toString(), pharmacyId);
+      }
     });
 
     // === Pharmacy Revenue ===
@@ -1539,9 +1902,11 @@ export const getDashboardData = async (req, res) => {
       const revenue = pharmacyRevenueMap.get(ph._id.toString()) || 0;
 
       const ordersCount = orders.filter(order =>
-        order.orderItems.some(item =>
-          medicineToPharmacyMap.get(item.medicineId?.toString()) === ph._id.toString()
-        )
+        order.orderItems.some(item => {
+          const medId = item.medicineId?.toString();
+          const phId = medicineToPharmacyMap.get(medId);
+          return phId === ph._id.toString();
+        })
       ).length;
 
       return {
@@ -1549,7 +1914,7 @@ export const getDashboardData = async (req, res) => {
         revenue,
         orders: ordersCount,
       };
-    }).sort((a, b) => b.revenue - a.revenue);
+    }).sort((a, b) => b.revenue - a.revenue).slice(0, 10); // Limit to top 10
 
     // === User Orders Summary ===
     const userOrdersMap = new Map();
@@ -1576,9 +1941,9 @@ export const getDashboardData = async (req, res) => {
 
       let onTime = 0, delayed = 0, cancelled = 0;
       userOrders.forEach(order => {
-        if (order.status === "cancelled") {
+        if (order.status === "Cancelled" || order.status === "cancelled") {
           cancelled++;
-        } else if (order.status === "delivered") {
+        } else if (order.status === "Delivered" || order.status === "delivered") {
           if (order.isDelayed) delayed++;
           else onTime++;
         }
@@ -1601,9 +1966,11 @@ export const getDashboardData = async (req, res) => {
       const phId = ph._id.toString();
 
       const totalOrders = orders.filter(order =>
-        order.orderItems.some(item =>
-          medicineToPharmacyMap.get(item.medicineId?.toString()) === phId
-        )
+        order.orderItems.some(item => {
+          const medId = item.medicineId?.toString();
+          const pharmacyId = medicineToPharmacyMap.get(medId);
+          return pharmacyId === phId;
+        })
       ).length;
 
       let avgRating = 0;
@@ -1614,7 +1981,11 @@ export const getDashboardData = async (req, res) => {
         avgRating = ph.rating;
       }
 
-      const medicinesAvailable = medicines.filter(med => med.pharmacyId?.toString() === phId).length;
+      const medicinesAvailable = medicines.filter(med => {
+        const pharmacyId = med.pharmacyId?._id?.toString() || med.pharmacyId?.toString();
+        return pharmacyId === phId;
+      }).length;
+      
       const joinedDate = ph.createdAt ? new Date(ph.createdAt).toISOString().split("T")[0] : "Unknown";
 
       return {
@@ -1629,18 +2000,20 @@ export const getDashboardData = async (req, res) => {
     // === Online Riders ===
     const onlineRidersCount = riders.filter(rider => rider.status === "online").length;
 
-    // === Final Response ===
+    // === Final Response (SAME STRUCTURE - NO CHANGES) ===
     res.json({
       stats: {
         totalUsers: users.length,
-        totalOrders,                      // ✅ FIXED
+        totalOrders,
         totalPharmacies: pharmacies.length,
-        totalMedicines: medicines.length,
+        totalMedicines,  // ✅ FIXED: Now only counts medicines from active pharmacies
         totalRiders: riders.length,
         onlineRiders: onlineRidersCount,
         activePharmacies: activePharmaciesCount,
         inactivePharmacies: inactivePharmaciesCount,
-        todaysOrders: todaysOrdersCount, // ✅ FIXED
+        todaysOrders: todaysOrdersCount,
+        // Optional: Add this if you want to show inactive medicines count
+        // inactiveMedicines: inactiveMedicinesCount,
       },
       revenueData,
       topPharmacies,
@@ -1649,7 +2022,7 @@ export const getDashboardData = async (req, res) => {
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("Dashboard Error:", error);
     res.status(500).json({
       message: "Failed to fetch dashboard data",
       error: error.message,
@@ -1657,8 +2030,6 @@ export const getDashboardData = async (req, res) => {
   }
 };
 
-
-// ✅ Create Banner Controller
 export const createBanner = async (req, res) => {
   try {
     // 🌟 Multiple images upload
