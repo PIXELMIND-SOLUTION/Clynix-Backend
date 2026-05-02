@@ -737,13 +737,18 @@ export const updateOrderStatusByVendor = async (req, res) => {
 
             const baseFare = nearestRider.baseFare || 30;
             order.deliveryCharge = Math.round(calculateDeliveryCharge(minDistance) + baseFare);
+<<<<<<< HEAD
+=======
+
+>>>>>>> 91afe20d792f853c8c178bc40c5acefe9ff6c5c5
 
             order.statusTimeline.push({
               status: "Rider Assigned",
               message: `Rider ${nearestRider.name} assigned`,
               timestamp: new Date(),
             });
-
+            // Notify user about rider assignment
+            await notifyUser(order.userId._id, "Rider Assigned", `A rider has been assigned to your order #${order._id.toString().slice(-6)} and will pick it up soon.`);
             nearestRider.notifications.push({
               message: "New order assigned to you",
               orderId: order._id,
